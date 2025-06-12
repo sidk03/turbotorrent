@@ -1,5 +1,5 @@
 The plan is to make a super duper quick bittorrent client and maybe a client to go along with it. Implemented in Python with minimal external libraires.
-Typer lib for minimal ClI tool.
+Typer lib for minimal ClI tool. Reminder to use UV for faster event loop.
 
 Features Client:
 1. Endgame mode.
