@@ -65,8 +65,9 @@ class TrackerClient:
         self, event: Optional[str] = None
     ) -> list[tuple[str, int]]:
         url = f"{self.announce_url}?{self._build_query(event)}"
+        headers = {"User-Agent": "TurboTorrentClient/1.0"}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
+            response = await client.get(url, headers=headers)
             response.raise_for_status()
             decoded = bencodepy.decode(response.content)
 
@@ -97,16 +98,16 @@ class TrackerClient:
     async def _announce_udp(self, event: Optional[str] = None) -> list[tuple[str, int]]:
         parsed = urlparse(self.announce_url)
         host = parsed.hostname
-        port = parsed.port or 80
+        port = parsed.port or 8080
 
         ACTION_CONNECT = 0
         ACTION_ANNOUNCE = 1
+        ACTION_ERROR = 3
         MAGIC_CONST = 0x41727101980
         EVENT_MAP = {None: 0, "completed": 1, "started": 2, "stopped": 3}
 
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
 
         max_retries = 8
         base_timeout = 15  # seconds
@@ -114,6 +115,7 @@ class TrackerClient:
         # CONNECT with retry
         connection_id = None
         try:
+            sock.setblocking(False)
             for retry in range(max_retries):
                 timeout = base_timeout * (2**retry)
                 transaction_id = random.randint(0, 2**32 - 1)
@@ -131,11 +133,15 @@ class TrackerClient:
                             "Failed to get connection ID from UDP tracker (no response)"
                         )
                     continue
-                if len(resp) >= 16:
-                    action, resp_tid, connection_id_ = struct.unpack("!LLQ", resp[:16])
-                    if action == ACTION_CONNECT and resp_tid == transaction_id:
-                        connection_id = connection_id_
-                        break  # success
+                if len(resp) >= 8:
+                    action, resp_tid = struct.unpack("!LL", resp[:8])
+                    if resp_tid == transaction_id:
+                        if action == ACTION_ERROR:
+                            error_msg = resp[8:].decode("utf-8", errors="ignore")
+                            raise Exception(f"UDP tracker error: {error_msg}")
+                        elif action == ACTION_CONNECT and len(resp) >= 16:
+                            connection_id = struct.unpack("!Q", resp[8:16])[0]
+                            break  # success
             else:
                 raise Exception(
                     "No valid response from UDP tracker during CONNECT phase"
@@ -174,21 +180,26 @@ class TrackerClient:
                             "Failed to get announce response from UDP tracker (no response)"
                         )
                     continue
-                if len(resp) >= 20:
-                    action, resp_tid, interval, leechers, seeders = struct.unpack(
-                        "!LLLLL", resp[:20]
-                    )
-                    if action == ACTION_ANNOUNCE and resp_tid == transaction_id:
-                        self.interval = interval
-                        self.complete = seeders
-                        self.incomplete = leechers
+                if len(resp) >= 8:
+                    action, resp_tid = struct.unpack("!LL", resp[:8])
+                    if resp_tid == transaction_id:
+                        if action == ACTION_ERROR:
+                            error_msg = resp[8:].decode("utf-8", errors="ignore")
+                            raise Exception(f"UDP tracker error: {error_msg}")
+                        elif action == ACTION_ANNOUNCE and len(resp) >= 20:
+                            interval, leechers, seeders = struct.unpack(
+                                "!LLL", resp[8:20]
+                            )
+                            self.interval = interval
+                            self.complete = seeders
+                            self.incomplete = leechers
 
-                        peers = []
-                        for i in range(20, len(resp), 6):
-                            ip = socket.inet_ntoa(resp[i : i + 4])
-                            peer_port = struct.unpack(">H", resp[i + 4 : i + 6])[0]
-                            peers.append((ip, peer_port))
-                        return peers
+                            peers = []
+                            for i in range(20, len(resp), 6):
+                                ip = socket.inet_ntoa(resp[i : i + 4])
+                                peer_port = struct.unpack(">H", resp[i + 4 : i + 6])[0]
+                                peers.append((ip, peer_port))
+                            return peers
             else:
                 raise Exception(
                     "No valid response from UDP tracker during ANNOUNCE phase"
