@@ -4,7 +4,7 @@ from pathlib import Path
 from src.torrent.metadata import TorrentFile, TorrentMetadata
 
 
-def parse_torrent_file(path: Path):
+def parse_torrent_file(path: Path) -> TorrentMetadata:
     with path.open("rb") as f:
         metainfo = bencodepy.decode(f.read())
 
