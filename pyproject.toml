@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "bencode-py>=4.0.0",
+    "bitarray>=3.5.0",
     "httpx>=0.28.1",
     "ruff>=0.12.2",
 ]

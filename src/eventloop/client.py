@@ -1,0 +1,2 @@
+class TorrentClient:
+    pass
