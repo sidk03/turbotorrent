@@ -1,6 +1,7 @@
 from src.eventloop.client import TorrentClient
 import asyncio
-import bitarray
+from bitarray import bitarray
+import struct
 
 
 class Peer:
@@ -41,7 +42,7 @@ class Peer:
         self.am_interested = False
         self.peer_choking = True
         self.peer_interested = False
-        self.bitfield = bitarray(client.pieces)
+        self.bitfield = bitarray(client.metadata.pieces)
 
         # Processing
         self.send_queue = asyncio.Queue()
@@ -51,3 +52,88 @@ class Peer:
 
         # Client
         self.client = client
+
+    async def connect(self):
+        try:
+            async with asyncio.timeout(10):
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port
+                )
+                await self._send_handshake()
+                await self._accept_handshake()
+
+                await self._send_bitfield()
+
+                self.running = True
+
+        except asyncio.TimeoutError:
+            print(f"Connection timeout to {self.host}:{self.port}")
+            await self._cleanup()
+            raise
+        except Exception as e:
+            await self._cleanup()
+            raise
+
+    async def _send_handshake(self):
+        # len, pstr, reserved, info_hash, my id
+        handshake = struct.pack(
+            "!B19s8s20s20s",
+            19,
+            "BitTorrent protocol",
+            b"\x00" * 8,
+            self.client.metadata.info_hash,
+            self.client.tracker.peer_id,
+        )
+        self.writer.write(handshake)
+        await self.writer.drain()
+
+    async def _accept_handshake(self):
+        try:
+            # Read exactly 68 bytes for handshake
+            async with asyncio.timeout(5):
+                handshake_data = await self.reader.readexactly(68)
+
+            # Unpack handshake
+            pstrlen, pstr, _, info_hash, peer_id = struct.unpack(
+                "!B19s8s20s20s", handshake_data
+            )
+
+            # Validate handshake
+            if pstrlen != 19:
+                raise ValueError(f"Invalid pstrlen: {pstrlen}")
+
+            if pstr != b"BitTorrent protocol":
+                raise ValueError(f"Invalid protocol string: {pstr}")
+
+            if info_hash != self.client.info_hash:
+                raise ValueError(f"Info hash mismatch")
+
+            # Store peer ID
+            self.peer_id = peer_id
+
+            # Decide what to do with duplicate connections !!!
+
+        except asyncio.IncompleteReadError as e:
+            raise ValueError(f"Incomplete handshake: received {len(e.partial)} bytes")
+        except struct.error as e:
+            raise ValueError(f"Invalid handshake format: {e}")
+
+    async def _send_bitfield(self):
+        if not self.client.bitfield.any():
+            print(f"Skipping bitfield message: no pieces available.")
+            return
+        bitfield_bytes = self.client.bitfield.tobytes()
+        message_id = 5
+        message_length = 1 + len(bitfield_bytes)
+        bitfield_message = struct.pack(
+            f"!IB{len(bitfield_bytes)}s", message_length, message_id, bitfield_bytes
+        )
+        self.writer.write(bitfield_message)
+        await self.writer.drain()
+
+    async def _cleanup(self) -> None:
+        if self.writer:
+            self.writer.close()
+            await self.writer.wait_closed()
+
+        # clear queues, cancle tasks

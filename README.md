@@ -10,7 +10,7 @@ Features Client:
 6. Optional BitTyrant + PropShare.
 7. Refined Choke Unchoke strategy.
 
-Features Tracker:
+Features Tracker: -> Done
 1. UDP tracker connection.
-2. HTTP + HTTPS tracker connection -> no libraries. 
+2. HTTP + HTTPS tracker connection.
 
