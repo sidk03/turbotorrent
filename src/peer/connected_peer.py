@@ -2,6 +2,7 @@ from src.eventloop.client import TorrentClient
 import asyncio
 from bitarray import bitarray
 import struct
+import math
 
 
 class Peer:
@@ -42,8 +43,7 @@ class Peer:
         self.am_interested = False
         self.peer_choking = True
         self.peer_interested = False
-        self.bitfield = bitarray(client.metadata.pieces)
-
+        self.bitfield: bitarray = None
         # Processing
         self.send_queue = asyncio.Queue()
         self.response_queue = asyncio.Queue()
@@ -155,6 +155,59 @@ class Peer:
         )
         self.writer.write(bitfield_message)
         await self.writer.drain()
+
+    async def _recieve_bitfield(self):
+        try:
+            length_prefix_bytes = await self.reader.readexactly(4)
+            (length_prefix,) = struct.unpack("!I", length_prefix_bytes)
+            if length_prefix < 1:
+                raise ValueError("Bitfield message too short")
+
+            message_id_bytes = await self.reader.readexactly(1)
+            (message_id,) = struct.unpack("!B", message_id_bytes)
+            if message_id != 5:
+                raise ValueError(f"Expected bitfield (5), got {message_id}")
+
+            # len check
+            bitfield_length = length_prefix - 1
+            num_pieces = self.client.metadata.pieces
+            expected_length = math.ceil(num_pieces / 8)
+
+            if bitfield_length != expected_length:
+                raise ValueError(
+                    f"Bitfield wrong length: expected {expected_length}, got {bitfield_length}"
+                )
+
+            bitfield_bytes = await self.reader.readexactly(bitfield_length)
+
+            # check if any spare bits are set, if so error
+            num_spare_bits = (8 - (num_pieces % 8)) % 8
+            if num_spare_bits:
+                last_byte = bitfield_bytes[-1]
+                spare_mask = (1 << num_spare_bits) - 1
+                if last_byte & spare_mask:
+                    raise ValueError(
+                        f"Bitfield has spare bits set: last_byte=0b{last_byte:08b}, mask=0b{spare_mask:08b}"
+                    )
+
+            bitfield = bitarray(endian="big")
+            bitfield.frombytes(bitfield_bytes)
+            bitfield = bitfield[:num_pieces]
+
+            self.bitfield = bitfield
+
+            print(
+                f"Received valid bitfield from {self.host}:{self.port}: {self.bitfield}"
+            )
+
+        except (asyncio.IncompleteReadError, ValueError) as e:
+            print(f"Bitfield error from {self.host}:{self.port}: {e}")
+            await self._cleanup()
+            raise
+        except Exception as e:
+            print(f"Unexpected error receiving bitfield: {e}")
+            await self._cleanup()
+            raise
 
     async def _cleanup(self) -> None:
         self.running = False
