@@ -48,7 +48,7 @@ class Peer:
         self.send_queue = asyncio.Queue()
         self.response_queue = asyncio.Queue()
         self.block_futures: dict[tuple[int, int], asyncio.Future] = {}
-        self.request_tasks: dict[tuple[int, int], asyncio.Task]
+        self.request_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
         # Client
         self.client = client
@@ -157,8 +157,13 @@ class Peer:
         await self.writer.drain()
 
     async def _cleanup(self) -> None:
+        self.running = False
+
         if self.writer:
             self.writer.close()
             await self.writer.wait_closed()
 
-        # clear queues, cancle tasks
+        for task in self.request_tasks.values():
+            task.cancel()
+
+        # clear send queue -> add blocks back to main queue
