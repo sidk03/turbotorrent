@@ -5,7 +5,10 @@ import struct
 import bencodepy
 import random
 import asyncio
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class TrackerClient:
@@ -47,6 +50,8 @@ class TrackerClient:
         self.complete = None
         self.incomplete = None
 
+        logger.info(f"Initialized tracker client for {announce_url}")
+
     def _build_query(self, event: Optional[str] = None) -> str:
         params = {
             "info_hash": self.info_hash,  # bytes; urlencode percent-encodes
@@ -64,6 +69,7 @@ class TrackerClient:
     async def _announce_http(
         self, event: Optional[str] = None
     ) -> list[tuple[str, int]]:
+        logger.info(f"Announcing to HTTP tracker: {self.announce_url} (event: {event})")
         url = f"{self.announce_url}?{self._build_query(event)}"
         headers = {"User-Agent": "TurboTorrentClient/1.0"}
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -72,6 +78,7 @@ class TrackerClient:
             decoded = bencodepy.decode(response.content)
 
         if b"failure reason" in decoded:
+            logger.error(f"Tracker failure: {decoded[b'failure reason'].decode()}")
             raise Exception(f"Tracker failure: {decoded[b'failure reason'].decode()}")
 
         self.interval = decoded.get(b"interval")
@@ -93,9 +100,14 @@ class TrackerClient:
                 ip = peer[b"ip"].decode()
                 peer_port = peer[b"port"]
                 peers.append((ip, peer_port))
+
+        logger.info(
+            f"HTTP tracker response: {len(peers)} peers, {self.complete} seeders, {self.incomplete} leechers"
+        )
         return peers
 
     async def _announce_udp(self, event: Optional[str] = None) -> list[tuple[str, int]]:
+        logger.info(f"Announcing to UDP tracker: {self.announce_url} (event: {event})")
         parsed = urlparse(self.announce_url)
         host = parsed.hostname
         port = parsed.port or 8080
@@ -129,6 +141,9 @@ class TrackerClient:
                     )
                 except asyncio.TimeoutError:
                     if retry == max_retries - 1:
+                        logger.error(
+                            f"UDP tracker connect timeout after {max_retries} retries"
+                        )
                         raise Exception(
                             "Failed to get connection ID from UDP tracker (no response)"
                         )
@@ -138,9 +153,11 @@ class TrackerClient:
                     if resp_tid == transaction_id:
                         if action == ACTION_ERROR:
                             error_msg = resp[8:].decode("utf-8", errors="ignore")
+                            logger.error(f"UDP tracker connect error: {error_msg}")
                             raise Exception(f"UDP tracker error: {error_msg}")
                         elif action == ACTION_CONNECT and len(resp) >= 16:
                             connection_id = struct.unpack("!Q", resp[8:16])[0]
+                            logger.info(f"Successfully connected to UDP tracker")
                             break  # success
             else:
                 raise Exception(
@@ -176,6 +193,9 @@ class TrackerClient:
                     )
                 except asyncio.TimeoutError:
                     if retry == max_retries - 1:
+                        logger.error(
+                            f"UDP tracker announce timeout after {max_retries} retries"
+                        )
                         raise Exception(
                             "Failed to get announce response from UDP tracker (no response)"
                         )
@@ -185,6 +205,7 @@ class TrackerClient:
                     if resp_tid == transaction_id:
                         if action == ACTION_ERROR:
                             error_msg = resp[8:].decode("utf-8", errors="ignore")
+                            logger.error(f"UDP tracker announce error: {error_msg}")
                             raise Exception(f"UDP tracker error: {error_msg}")
                         elif action == ACTION_ANNOUNCE and len(resp) >= 20:
                             interval, leechers, seeders = struct.unpack(
@@ -199,6 +220,10 @@ class TrackerClient:
                                 ip = socket.inet_ntoa(resp[i : i + 4])
                                 peer_port = struct.unpack(">H", resp[i + 4 : i + 6])[0]
                                 peers.append((ip, peer_port))
+
+                            logger.info(
+                                f"UDP tracker response: {len(peers)} peers, {seeders} seeders, {leechers} leechers"
+                            )
                             return peers
             else:
                 raise Exception(
@@ -214,20 +239,27 @@ class TrackerClient:
         elif scheme == "udp":
             return await self._announce_udp(event)
         else:
+            logger.error(f"Unsupported tracker protocol: {scheme}")
             raise ValueError(f"Unsupported tracker protocol: {scheme}")
 
     async def started(self) -> list[tuple[str, int]]:
+        logger.info("Announcing torrent start to tracker")
         return await self.announce(event="started")
 
     async def completed(self) -> list[tuple[str, int]]:
+        logger.info("Announcing torrent completion to tracker")
         self.left = 0
         self.downloaded = self.total_length
         return await self.announce(event="completed")
 
     async def stopped(self) -> list[tuple[str, int]]:
+        logger.info("Announcing torrent stop to tracker")
         return await self.announce(event="stopped")
 
     async def update(self, downloaded: int, uploaded: int) -> list[tuple[str, int]]:
+        logger.info(
+            f"Updating tracker: downloaded={downloaded}, uploaded={uploaded}, left={self.left}"
+        )
         self.downloaded = downloaded
         self.uploaded = uploaded
         self.left = max(0, self.total_length - downloaded)

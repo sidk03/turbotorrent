@@ -3,6 +3,9 @@ import asyncio
 from bitarray import bitarray
 import struct
 import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Peer:

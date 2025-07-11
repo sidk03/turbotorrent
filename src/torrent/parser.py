@@ -2,9 +2,14 @@ import hashlib
 import bencodepy
 from pathlib import Path
 from src.torrent.metadata import TorrentFile, TorrentMetadata
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def parse_torrent_file(path: Path) -> TorrentMetadata:
+    logger.info(f"Parsing torrent file: {path}")
+
     with path.open("rb") as f:
         metainfo = bencodepy.decode(f.read())
 
@@ -25,10 +30,14 @@ def parse_torrent_file(path: Path) -> TorrentMetadata:
             files.append(TorrentFile(path_segments, length, offset))
             offset += length
         total_length = offset
+        logger.info(
+            f"Parsed multi-file torrent: {name} ({len(files)} files, {total_length} bytes)"
+        )
     else:
         length = info[b"length"]
         files.append(TorrentFile([name], length, 0))
         total_length = length
+        logger.info(f"Parsed single-file torrent: {name} ({total_length} bytes)")
 
     return TorrentMetadata(
         announce=announce,
