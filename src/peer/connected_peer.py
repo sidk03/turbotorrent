@@ -140,11 +140,19 @@ class Peer:
             self.peer_id = peer_id
 
             # Decide what to do with duplicate connections !!!
+            if self._is_duplicate_peer(peer_id):
+                raise ValueError(f"Already connected to peer {peer_id}")
 
         except asyncio.IncompleteReadError as e:
             raise ValueError(f"Incomplete handshake: received {len(e.partial)} bytes")
         except struct.error as e:
             raise ValueError(f"Invalid handshake format: {e}")
+
+    def _is_duplicate_peer(self, peer_id: bytes) -> bool:
+        for peer in self.client.connected_peers:
+            if peer != self and peer.peer_id == peer_id and peer.running:
+                return True
+        return False
 
     async def _send_bitfield(self):
         if not self.client.bitfield.any():
