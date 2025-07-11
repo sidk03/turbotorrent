@@ -53,23 +53,48 @@ class Peer:
         # Client
         self.client = client
 
-    async def connect(self):
+    async def send_connection(self):
         try:
             async with asyncio.timeout(10):
                 self.reader, self.writer = await asyncio.open_connection(
                     self.host, self.port
                 )
-                await self._send_handshake()
-                await self._accept_handshake()
+            await self._send_handshake()
+            await self._accept_handshake()
 
-                await self._send_bitfield()
+            await self._send_bitfield()
 
-                self.running = True
+            self.running = True
+
+            # start workers
 
         except asyncio.TimeoutError:
-            print(f"Connection timeout to {self.host}:{self.port}")
+            print(f"Connection timeout to {self.host}:{self.port} -> Outgoing")
             await self._cleanup()
             raise
+        except Exception as e:
+            await self._cleanup()
+            raise
+
+    async def accept_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        self.reader = reader
+        self.writer = writer
+        try:
+            await self._accept_handshake()
+            await self._send_handshake()
+
+            await self._send_bitfield()
+
+            self.running = True
+
+            peername = writer.get_extra_info("peername")
+            if peername:
+                self.host, self.port = peername
+
+            # start workers
+
         except Exception as e:
             await self._cleanup()
             raise
