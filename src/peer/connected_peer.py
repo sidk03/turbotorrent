@@ -69,12 +69,8 @@ class Peer:
                 self.reader, self.writer = await asyncio.open_connection(
                     self.host, self.port
                 )
-            await self._send_handshake()
-            await self._accept_handshake()
 
-            await self._send_bitfield()
-
-            self.connected = True
+            self._handshake_sequence(initiator=True)
 
             # start workers
 
@@ -92,12 +88,7 @@ class Peer:
         self.reader = reader
         self.writer = writer
         try:
-            await self._accept_handshake()
-            await self._send_handshake()
-
-            await self._send_bitfield()
-
-            self.connected = True
+            self._handshake_sequence(initiator=False)
 
             peername = writer.get_extra_info("peername")
             if peername:
@@ -108,6 +99,17 @@ class Peer:
         except Exception as e:
             await self._cleanup()
             raise
+
+    async def _handshake_sequence(self, initiator: bool):
+        if initiator:
+            await self._send_handshake()
+            await self._receive_handshake()
+        else:
+            await self._receive_handshake()
+            await self._send_handshake()
+
+        self.connected = True
+        await self._send_bitfield()
 
     async def _send_handshake(self):
         # len, pstr, reserved, info_hash, my id
@@ -122,7 +124,7 @@ class Peer:
         self.writer.write(handshake)
         await self.writer.drain()
 
-    async def _accept_handshake(self):
+    async def _receive_handshake(self):
         try:
             # Read exactly 68 bytes for handshake
             async with asyncio.timeout(5):
@@ -156,10 +158,10 @@ class Peer:
             raise ValueError(f"Invalid handshake format: {e}")
 
     def _is_duplicate_peer(self, peer_id: bytes) -> bool:
-        for peer in self.client.connected_peers:
-            if peer != self and peer.peer_id == peer_id and peer.connected:
-                return True
-        return False
+        return any(
+            p.peer_id == peer_id and p != self and p.connected
+            for p in self.client.connected_peers
+        )
 
     async def _send_bitfield(self):
         if not self.client.bitfield.any():
