@@ -4,6 +4,7 @@ from bitarray import bitarray
 import struct
 import math
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class Peer:
         "peer_id",
         "reader",
         "writer",
-        "running",
+        "connected",
         # Bit protocol State
         "am_choking",
         "am_interested",
@@ -28,6 +29,8 @@ class Peer:
         "response_queue",
         "block_futures",
         "request_tasks",
+        # Stats
+        "last_message_time",
         # Client
         "client",
     )
@@ -39,7 +42,7 @@ class Peer:
         self.peer_id: str = None
         self.reader: asyncio.StreamReader = None
         self.writer: asyncio.StreamWriter = None
-        self.running = False
+        self.connected = False
 
         # Bit protocol State
         self.am_choking = True
@@ -47,11 +50,15 @@ class Peer:
         self.peer_choking = True
         self.peer_interested = False
         self.bitfield: bitarray = None
+
         # Processing
         self.send_queue = asyncio.Queue()
         self.response_queue = asyncio.Queue()
         self.block_futures: dict[tuple[int, int], asyncio.Future] = {}
         self.request_tasks: dict[tuple[int, int], asyncio.Task] = {}
+
+        # Stats
+        self.last_message_time = time.time()
 
         # Client
         self.client = client
@@ -67,7 +74,7 @@ class Peer:
 
             await self._send_bitfield()
 
-            self.running = True
+            self.connected = True
 
             # start workers
 
@@ -90,7 +97,7 @@ class Peer:
 
             await self._send_bitfield()
 
-            self.running = True
+            self.connected = True
 
             peername = writer.get_extra_info("peername")
             if peername:
@@ -150,7 +157,7 @@ class Peer:
 
     def _is_duplicate_peer(self, peer_id: bytes) -> bool:
         for peer in self.client.connected_peers:
-            if peer != self and peer.peer_id == peer_id and peer.running:
+            if peer != self and peer.peer_id == peer_id and peer.connected:
                 return True
         return False
 
@@ -234,8 +241,23 @@ class Peer:
             self.writer.write(message)
             await self.writer.drain()
 
+    async def _keep_alive_worker(self):
+        while self.connected:
+            await asyncio.sleep(60)
+
+            if time.time() - self.last_message_time > 120:
+                logger.warning(f"Peer {self.host}:{self.port} timed out")
+                await self._cleanup()
+                break
+
+            try:
+                self.writer.write(struct.pack("!I", 0))
+                await self.writer.drain()
+            except Exception:
+                break
+
     async def _cleanup(self) -> None:
-        self.running = False
+        self.connected = False
 
         if self.writer:
             self.writer.close()
