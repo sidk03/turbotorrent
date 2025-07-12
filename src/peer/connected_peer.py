@@ -220,6 +220,20 @@ class Peer:
             await self._cleanup()
             raise
 
+    async def send_interested(self):
+        if not self.am_interested:
+            self.am_interested = True
+            message = struct.pack("!IB", 1, 2)
+            self.writer.write(message)
+            await self.writer.drain()
+
+    async def send_not_interested(self):
+        if self.am_interested:
+            self.am_interested = False
+            message = struct.pack("!IB", 1, 3)
+            self.writer.write(message)
+            await self.writer.drain()
+
     async def _cleanup(self) -> None:
         self.running = False
 
