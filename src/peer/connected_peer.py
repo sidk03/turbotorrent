@@ -33,6 +33,8 @@ class Peer:
         "last_message_time",
         # Client
         "client",
+        # Workers
+        "workers",
     )
 
     def __init__(self, host: str, port: int, client: TorrentClient):
@@ -63,6 +65,9 @@ class Peer:
         # Client
         self.client = client
 
+        # Workers
+        self._workers: list[asyncio.Task] = []
+
     async def send_connection(self):
         try:
             async with asyncio.timeout(10):
@@ -73,6 +78,7 @@ class Peer:
             self._handshake_sequence(initiator=True)
 
             # start workers
+            self._start_workers()
 
         except asyncio.TimeoutError:
             print(f"Connection timeout to {self.host}:{self.port} -> Outgoing")
@@ -95,10 +101,18 @@ class Peer:
                 self.host, self.port = peername
 
             # start workers
+            self._start_workers()
 
         except Exception as e:
             await self._cleanup()
             raise
+
+    def _start_workers(self):
+        self._workers = [
+            asyncio.create_task(self._request_worker()),
+            asyncio.create_task(self._receive_worker()),
+            asyncio.create_task(self._keep_alive_worker()),
+        ]
 
     async def _handshake_sequence(self, initiator: bool):
         if initiator:
