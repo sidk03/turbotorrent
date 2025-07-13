@@ -1,4 +1,4 @@
-from src.eventloop.client import TorrentClient
+from src.eventloop.client import TorrentClient, Block
 import asyncio
 from bitarray import bitarray
 import struct
@@ -22,12 +22,13 @@ class Peer:
         "am_choking",
         "am_interested",
         "peer_choking",
-        "peer_intertsted",
+        "peer_interested",
         "bitfield",
         # Processing
         "pending_requests",
         "max_concurrent",
         "score",
+        "semaphore",
         # Performance
         "stats",
         "last_message_time",
@@ -54,9 +55,10 @@ class Peer:
         self.bitfield: bitarray = None
 
         # Processing
-        self.pending_requests: dict[tuple[int, int], asyncio.Future] = {}
+        self.pending_requests: dict[tuple[int, int], tuple[asyncio.Future, Block]] = {}
         self.max_concurrent = 10
         self.score = 1.0
+        self.semaphore = asyncio.Semaphore(10)
 
         # Stats
         self.stats = {
@@ -79,7 +81,7 @@ class Peer:
                     self.host, self.port
                 )
 
-            self._handshake_sequence(initiator=True)
+            await self._handshake_sequence(initiator=True)
 
             # start workers
             self._start_workers()
@@ -98,7 +100,7 @@ class Peer:
         self.reader = reader
         self.writer = writer
         try:
-            self._handshake_sequence(initiator=False)
+            await self._handshake_sequence(initiator=False)
 
             peername = writer.get_extra_info("peername")
             if peername:
@@ -187,7 +189,7 @@ class Peer:
         self.writer.write(bitfield_message)
         await self.writer.drain()
 
-    async def _recieve_bitfield(self, payload: bytes):
+    async def _receive_bitfield(self, payload: bytes):
         try:
             num_pieces = self.client.metadata.pieces
             expected_length = math.ceil(num_pieces / 8)
@@ -251,9 +253,9 @@ class Peer:
     async def _request_worker(self):
         while self.connected:
             try:
-                if len(self.pending_requests) >= self.max_concurrent:
-                    asyncio.sleep(0.05)
-                    continue
+                await (
+                    self.semaphore.acquire()
+                )  # acquired here, released after future reolved or timedout
 
                 if self.score < 1.0:
                     await asyncio.sleep((1 - self.score) * 0.5)
@@ -262,11 +264,13 @@ class Peer:
 
                 if not self.bitfield or not self.bitfield[block.piece_index]:
                     await self.client.central_queue.put(block)
+                    self.semaphore.release()
                     await asyncio.sleep(0.01)  # Prevent tight loop
                     continue
 
                 if self.peer_choking:
                     await self.client.central_queue.put(block)
+                    self.semaphore.release()
                     await asyncio.sleep(0.1)  # Wait a bit before trying again
                     continue
 
@@ -274,6 +278,7 @@ class Peer:
 
                 # Skip if this peer alr has this block in flight
                 if block_id in self.pending_requests:
+                    self.semaphore.release()
                     await self.client.central_queue.put(block)
                     continue
 
@@ -293,7 +298,7 @@ class Peer:
         try:
             # Claim block locally
             future = asyncio.Future()
-            self.pending_requests[block_id] = future
+            self.pending_requests[block_id] = (future, block)
 
             message = struct.pack(
                 "!IBIII", 13, 6, block.piece_index, block.offset, block.length
@@ -324,7 +329,8 @@ class Peer:
             await self.client.central_queue.put(block)
 
         finally:
-            del self.pending_requests[block_id]
+            self.semaphore.release()
+            self.pending_requests.pop(block_id, None)
 
     async def _receive_worker(self):
         buffer = bytearray(65536)  # one 64KB buffer for efficiency
@@ -392,7 +398,7 @@ class Peer:
                     await self.send_interested()
 
         elif msg_id == 5:  # Bitfield
-            self._recieve_bitfield(payload)
+            await self._receive_bitfield(payload)
             # Send interested if we need pieces
             if not self.am_interested and self._need_pieces():
                 await self.send_interested()
@@ -403,7 +409,7 @@ class Peer:
         elif msg_id == 7:  # Piece
             self._handle_piece(payload)
 
-    async def _handle_piece(self, payload: bytes):
+    def _handle_piece(self, payload: bytes):
         if len(payload) < 8:
             return
 
@@ -416,7 +422,7 @@ class Peer:
             future.set_result(data)
             self.stats["bytes_downloaded"] += len(data)
 
-    async def _need_pieces(self):
+    def _need_pieces(self):
         return bool((self.bitfield & ~self.client.bitfield).any())
 
     async def _update_stats(self, success: bool, response_time: float = 0):
@@ -429,7 +435,12 @@ class Peer:
             # Adaptive concurrency
             if self.stats["completed"] & 15 == 0:  # Every 16 successes
                 if self.score > 0.9:
-                    self.max_concurrent = min(30, self.max_concurrent + 2)
+                    new_max = min(30, self.max_concurrent + 2)
+                    delta = new_max - self.max_concurrent
+                    if delta > 0:
+                        for _ in range(delta):
+                            self.semaphore.release()
+                    self.max_concurrent = new_max
 
         else:
             self.stats["timeouts"] += 1
@@ -440,6 +451,8 @@ class Peer:
             # Reduce concurrency
             if self.stats["timeouts"] & 3 == 0:  # Every 4 timeouts
                 self.max_concurrent = max(2, self.max_concurrent - 2)
+
+            # I need to figure out how to decrease semaphore count
 
     async def send_interested(self):
         if not self.am_interested:
@@ -469,8 +482,8 @@ class Peer:
                 pass
 
         if self.pending_requests:
-            for block_id in self.pending_requests.keys():
-                await self.client.central_queue.put(block_id)
+            for _, block in self.pending_requests.values():
+                await self.client.central_queue.put(block)
 
         try:
             self.client.connected_peers.remove(self)
