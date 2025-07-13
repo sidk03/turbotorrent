@@ -53,7 +53,7 @@ class Peer:
         self.bitfield: bitarray = None
 
         # Processing
-        self.pending_requests : dict[tuple[int,int], asyncio.Future] = {}
+        self.pending_requests: dict[tuple[int, int], asyncio.Future] = {}
         self.max_concurrent = 10
         self.score = 1.0
 
@@ -105,7 +105,6 @@ class Peer:
             await self._cleanup()
             raise
 
-    
     async def _handshake_sequence(self, initiator: bool):
         if initiator:
             await self._send_handshake()
@@ -305,30 +304,29 @@ class Peer:
             self.pending_requests[block_id] = future
 
             message = struct.pack(
-                "!IBIII", 13, 6, 
-                block.piece_index, block.offset, block.length
+                "!IBIII", 13, 6, block.piece_index, block.offset, block.length
             )
             self.writer.write(message)
             await self.writer.drain()
 
             try:
                 data = await asyncio.wait_for(future, timeout=30.0)
-                
+
                 # Success
                 elapsed = time.time() - start_time
                 self._update_stats(success=True, response_time=elapsed)
-                
+
                 # Queue for verification
                 await self.client.receive_queue.put((block, data))
-                
+
             except asyncio.TimeoutError:
                 # Timeout - re-queue with priority
                 self._update_stats(success=False)
-                
-                block.retry_count = getattr(block, 'retry_count', 0) + 1
+
+                block.retry_count = getattr(block, "retry_count", 0) + 1
                 block.priority = -1000 - block.retry_count
                 await self.client.central_queue.put(block)
-                
+
         except Exception as e:
             logger.error(f"Block request error {block_id}: {e}")
             await self.client.central_queue.put(block)
@@ -336,12 +334,6 @@ class Peer:
         finally:
             del self.pending_requests[block_id]
 
-
-
-   
-
-
-    
     async def send_interested(self):
         if not self.am_interested:
             self.am_interested = True
