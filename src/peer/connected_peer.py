@@ -391,8 +391,24 @@ class Peer:
             if not self.am_interested and self._need_pieces():
                 await self.send_interested()
 
+        elif msg_id == 6:  # Request Block, will fill in later
+            pass
+
         elif msg_id == 7:  # Piece
             self._handle_piece(payload)
+
+    async def _handle_piece(self, payload: bytes):
+        if len(payload) < 8:
+            return
+
+        piece_index, offset = struct.unpack_from("!II", payload, 0)
+        data = payload[8:]
+
+        block_id = (piece_index, offset)
+        future = self.pending_requests.get(block_id, None)
+        if future and not future.done():
+            future.set_result(data)
+            self.stats["bytes_downloaded"] += len(data)
 
     async def _need_pieces(self):
         return bool((self.bitfield & ~self.client.bitfield).any())
