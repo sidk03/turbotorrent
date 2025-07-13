@@ -394,6 +394,9 @@ class Peer:
         elif msg_id == 7:  # Piece
             self._handle_piece(payload)
 
+    async def _need_pieces(self):
+        return bool((self.bitfield & ~self.client.bitfield).any())
+
     async def send_interested(self):
         if not self.am_interested:
             self.am_interested = True
