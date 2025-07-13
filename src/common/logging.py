@@ -107,7 +107,7 @@ LOGGING_CONFIG = {
     "handlers": {
         "stderr": {
             "class": "logging.StreamHandler",
-            "level": "WARNING",
+            "level": "INFO",
             "formatter": "simple",
             "stream": "ext://sys.stdout",
         },
