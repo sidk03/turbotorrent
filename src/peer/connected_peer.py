@@ -181,34 +181,20 @@ class Peer:
         self.writer.write(bitfield_message)
         await self.writer.drain()
 
-    async def _recieve_bitfield(self):
+    async def _recieve_bitfield(self, payload: bytes):
         try:
-            length_prefix_bytes = await self.reader.readexactly(4)
-            (length_prefix,) = struct.unpack("!I", length_prefix_bytes)
-            if length_prefix < 1:
-                raise ValueError("Bitfield message too short")
-
-            message_id_bytes = await self.reader.readexactly(1)
-            (message_id,) = struct.unpack("!B", message_id_bytes)
-            if message_id != 5:
-                raise ValueError(f"Expected bitfield (5), got {message_id}")
-
-            # len check
-            bitfield_length = length_prefix - 1
             num_pieces = self.client.metadata.pieces
             expected_length = math.ceil(num_pieces / 8)
 
-            if bitfield_length != expected_length:
+            if len(payload) != expected_length:
                 raise ValueError(
-                    f"Bitfield wrong length: expected {expected_length}, got {bitfield_length}"
+                    f"Bitfield wrong length: expected {expected_length}, got {len(payload)}"
                 )
-
-            bitfield_bytes = await self.reader.readexactly(bitfield_length)
 
             # check if any spare bits are set, if so error
             num_spare_bits = (8 - (num_pieces % 8)) % 8
             if num_spare_bits:
-                last_byte = bitfield_bytes[-1]
+                last_byte = payload[-1]
                 spare_mask = (1 << num_spare_bits) - 1
                 if last_byte & spare_mask:
                     raise ValueError(
@@ -216,7 +202,7 @@ class Peer:
                     )
 
             bitfield = bitarray(endian="big")
-            bitfield.frombytes(bitfield_bytes)
+            bitfield.frombytes(payload)
             bitfield = bitfield[:num_pieces]
 
             self.bitfield = bitfield
@@ -374,6 +360,39 @@ class Peer:
                 break
 
         await self._cleanup()
+
+    async def _handle_message(self, msg_id: int, payload: bytes):
+        if msg_id == 0:  # Choke
+            self.peer_choking = True
+
+        elif msg_id == 1:  # Unchoke
+            self.peer_choking = False
+            # Send interested if we need pieces
+            if not self.am_interested and self._need_pieces():
+                await self.send_interested()
+
+        elif msg_id == 2:  # Interested
+            self.peer_interested = True
+
+        elif msg_id == 3:  # Not interested
+            self.peer_interested = False
+
+        elif msg_id == 4:  # Have
+            (piece_index,) = struct.unpack("!I", payload)
+            if self.bitfield and 0 <= piece_index < len(self.bitfield):
+                self.bitfield[piece_index] = 1
+                # Send interested if we need pieces
+                if not self.am_interested and self._need_pieces():
+                    await self.send_interested()
+
+        elif msg_id == 5:  # Bitfield
+            self._recieve_bitfield(payload)
+            # Send interested if we need pieces
+            if not self.am_interested and self._need_pieces():
+                await self.send_interested()
+
+        elif msg_id == 7:  # Piece
+            self._handle_piece(payload)
 
     async def send_interested(self):
         if not self.am_interested:
