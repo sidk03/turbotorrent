@@ -25,10 +25,9 @@ class Peer:
         "peer_intertsted",
         "bitfield",
         # Processing
-        "send_queue",
-        "response_queue",
-        "block_futures",
-        "request_tasks",
+        "pending_requests",
+        "max_concurrent",
+        "score",
         # Stats
         "last_message_time",
         # Client
@@ -54,10 +53,9 @@ class Peer:
         self.bitfield: bitarray = None
 
         # Processing
-        self.send_queue = asyncio.Queue()
-        self.response_queue = asyncio.Queue()
-        self.block_futures: dict[tuple[int, int], asyncio.Future] = {}
-        self.request_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self.pending_requests : dict[tuple[int,int], asyncio.Future] = {}
+        self.max_concurrent = 10
+        self.score = 1.0
 
         # Stats
         self.last_message_time = time.time()
@@ -107,13 +105,7 @@ class Peer:
             await self._cleanup()
             raise
 
-    def _start_workers(self):
-        self._workers = [
-            asyncio.create_task(self._request_worker()),
-            asyncio.create_task(self._receive_worker()),
-            asyncio.create_task(self._keep_alive_worker()),
-        ]
-
+    
     async def _handshake_sequence(self, initiator: bool):
         if initiator:
             await self._send_handshake()
@@ -243,19 +235,12 @@ class Peer:
             await self._cleanup()
             raise
 
-    async def send_interested(self):
-        if not self.am_interested:
-            self.am_interested = True
-            message = struct.pack("!IB", 1, 2)
-            self.writer.write(message)
-            await self.writer.drain()
-
-    async def send_not_interested(self):
-        if self.am_interested:
-            self.am_interested = False
-            message = struct.pack("!IB", 1, 3)
-            self.writer.write(message)
-            await self.writer.drain()
+    def _start_workers(self):
+        self._workers = [
+            asyncio.create_task(self._request_worker()),
+            asyncio.create_task(self._receive_worker()),
+            asyncio.create_task(self._keep_alive_worker()),
+        ]
 
     async def _keep_alive_worker(self):
         while self.connected:
@@ -271,6 +256,105 @@ class Peer:
                 await self.writer.drain()
             except Exception:
                 break
+
+    async def _request_worker(self):
+        while self.connected:
+            try:
+                if len(self.pending_requests) >= self.max_concurrent:
+                    asyncio.sleep(0.05)
+                    continue
+
+                if self.score < 1.0:
+                    await asyncio.sleep((1 - self.score) * 0.5)
+
+                block = await self.client.central_queue.get()
+
+                if not self.bitfield or not self.bitfield[block.piece_index]:
+                    await self.client.central_queue.put(block)
+                    await asyncio.sleep(0.01)  # Prevent tight loop
+                    continue
+
+                if self.peer_choking:
+                    await self.client.central_queue.put(block)
+                    await asyncio.sleep(0.1)  # Wait a bit before trying again
+                    continue
+
+                block_id = (block.piece_index, block.offset)
+
+                # Skip if this peer alr has this block in flight
+                if block_id in self.pending_requests:
+                    await self.client.central_queue.put(block)
+                    continue
+
+                # Fire away do not block
+                asyncio.create_task(self._request_block(block))
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Request worker error: {e}")
+                await asyncio.sleep(1)
+
+    async def _request_block(self, block):
+        block_id = (block.piece_index, block.offset)
+        start_time = time.time()
+
+        try:
+            # Claim block locally
+            future = asyncio.Future()
+            self.pending_requests[block_id] = future
+
+            message = struct.pack(
+                "!IBIII", 13, 6, 
+                block.piece_index, block.offset, block.length
+            )
+            self.writer.write(message)
+            await self.writer.drain()
+
+            try:
+                data = await asyncio.wait_for(future, timeout=30.0)
+                
+                # Success
+                elapsed = time.time() - start_time
+                self._update_stats(success=True, response_time=elapsed)
+                
+                # Queue for verification
+                await self.client.receive_queue.put((block, data))
+                
+            except asyncio.TimeoutError:
+                # Timeout - re-queue with priority
+                self._update_stats(success=False)
+                
+                block.retry_count = getattr(block, 'retry_count', 0) + 1
+                block.priority = -1000 - block.retry_count
+                await self.client.central_queue.put(block)
+                
+        except Exception as e:
+            logger.error(f"Block request error {block_id}: {e}")
+            await self.client.central_queue.put(block)
+
+        finally:
+            del self.pending_requests[block_id]
+
+
+
+   
+
+
+    
+    async def send_interested(self):
+        if not self.am_interested:
+            self.am_interested = True
+            message = struct.pack("!IB", 1, 2)
+            self.writer.write(message)
+            await self.writer.drain()
+
+    async def send_not_interested(self):
+        if self.am_interested:
+            self.am_interested = False
+            message = struct.pack("!IB", 1, 3)
+            self.writer.write(message)
+            await self.writer.drain()
 
     async def _cleanup(self) -> None:
         self.connected = False
