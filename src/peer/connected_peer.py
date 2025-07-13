@@ -334,6 +334,47 @@ class Peer:
         finally:
             del self.pending_requests[block_id]
 
+    async def _recieve_worker(self):
+        buffer = bytearray(65536)  # one 64KB buffer for efficiency
+        buffer_view = memoryview(buffer)
+
+        while self.connected:
+            try:
+                # msg length
+                await self.reader.readinto(buffer_view[:4])
+                (length,) = struct.unpack("!I", buffer_view[:4])
+
+                if length == 0:  # Keep-alive
+                    self.last_message_time = time.time()
+                    continue
+
+                # msg id
+                await self.reader.readinto(buffer_view[:1])
+                msg_id = buffer_view[0]
+
+                # payload if payload
+                payload_length = length - 1
+                if payload_length > 0:
+                    if payload_length <= 65531:  # Fits in buffer
+                        await self.reader.readinto(buffer_view[:payload_length])
+                        payload = buffer_view[:payload_length].tobytes()
+                    else:  # Large payload
+                        payload = await self.reader.readexactly(payload_length)
+                else:
+                    payload = b""
+
+                await self._handle_message(msg_id, payload)
+                self.last_message_time = time.time()
+
+            except asyncio.IncompleteReadError:
+                logger.info(f"Peer {self.host}:{self.port} disconnected")
+                break
+            except Exception as e:
+                logger.error(f"Receive error: {e}")
+                break
+
+        await self._cleanup()
+
     async def send_interested(self):
         if not self.am_interested:
             self.am_interested = True
