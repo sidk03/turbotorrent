@@ -28,7 +28,8 @@ class Peer:
         "pending_requests",
         "max_concurrent",
         "score",
-        # Stats
+        # Performance
+        "stats",
         "last_message_time",
         # Client
         "client",
@@ -58,6 +59,11 @@ class Peer:
         self.score = 1.0
 
         # Stats
+        self.stats = {
+            "completed": 0,
+            "timeouts": 0,
+            "bytes_downloaded": 0,
+        }
         self.last_message_time = time.time()
 
         # Client
@@ -320,7 +326,7 @@ class Peer:
         finally:
             del self.pending_requests[block_id]
 
-    async def _recieve_worker(self):
+    async def _receive_worker(self):
         buffer = bytearray(65536)  # one 64KB buffer for efficiency
         buffer_view = memoryview(buffer)
 
@@ -349,8 +355,8 @@ class Peer:
                 else:
                     payload = b""
 
-                await self._handle_message(msg_id, payload)
                 self.last_message_time = time.time()
+                await self._handle_message(msg_id, payload)
 
             except asyncio.IncompleteReadError:
                 logger.info(f"Peer {self.host}:{self.port} disconnected")
@@ -413,6 +419,28 @@ class Peer:
     async def _need_pieces(self):
         return bool((self.bitfield & ~self.client.bitfield).any())
 
+    async def _update_stats(self, success: bool, response_time: float = 0):
+        if success:
+            self.stats["completed"] += 1
+
+            # Increase score
+            self.score = min(1.0, self.score + 0.02)
+
+            # Adaptive concurrency
+            if self.stats["completed"] & 15 == 0:  # Every 16 successes
+                if self.score > 0.9:
+                    self.max_concurrent = min(30, self.max_concurrent + 2)
+
+        else:
+            self.stats["timeouts"] += 1
+
+            # Decrease score
+            self.score = max(0.1, self.score - 0.15)
+
+            # Reduce concurrency
+            if self.stats["timeouts"] & 3 == 0:  # Every 4 timeouts
+                self.max_concurrent = max(2, self.max_concurrent - 2)
+
     async def send_interested(self):
         if not self.am_interested:
             self.am_interested = True
@@ -430,11 +458,21 @@ class Peer:
     async def _cleanup(self) -> None:
         self.connected = False
 
-        if self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
-
-        for task in self.request_tasks.values():
+        for task in self._workers:
             task.cancel()
 
-        # clear send queue -> add blocks back to main queue
+        if self.writer:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
+
+        if self.pending_requests:
+            for block_id in self.pending_requests.keys():
+                await self.client.central_queue.put(block_id)
+
+        try:
+            self.client.connected_peers.remove(self)
+        except ValueError:
+            pass
