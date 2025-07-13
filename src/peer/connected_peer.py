@@ -285,9 +285,8 @@ class Peer:
                 # Fire away do not block
                 asyncio.create_task(self._request_block(block))
 
-            except asyncio.CancelledError:
-                raise
             except Exception as e:
+                self.semaphore.release()
                 logger.error(f"Request worker error: {e}")
                 await asyncio.sleep(1)
 
