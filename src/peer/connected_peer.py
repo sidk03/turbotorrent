@@ -416,7 +416,7 @@ class Peer:
         data = payload[8:]
 
         block_id = (piece_index, offset)
-        future = self.pending_requests.get(block_id, None)
+        future, _ = self.pending_requests.get(block_id, (None, None))
         if future and not future.done():
             future.set_result(data)
             self.stats["bytes_downloaded"] += len(data)
@@ -424,7 +424,7 @@ class Peer:
     def _need_pieces(self):
         return bool((self.bitfield & ~self.client.bitfield).any())
 
-    async def _update_stats(self, success: bool, response_time: float = 0):
+    def _update_stats(self, success: bool, response_time: float = 0):
         if success:
             self.stats["completed"] += 1
 
