@@ -14,3 +14,6 @@ Features Tracker: -> Done
 1. UDP tracker connection.
 2. HTTP + HTTPS tracker connection.
 
+Bug Reminder:
+1. peer has to be updated to account for priority queue
+
