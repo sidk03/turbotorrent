@@ -21,6 +21,9 @@ class Block:
         self.retry_count = 0
         self.last_peer = None  # Track which peer last attempted
 
+    def __lt__(self, other):
+        return self.priority < other.priority
+
 
 class TorrentClient:
     pass
