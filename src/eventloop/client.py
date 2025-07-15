@@ -8,6 +8,7 @@ import os
 import asyncio
 import time
 import logging
+import mmap
 
 config_logging("torrent.log.jsonl")
 
@@ -130,7 +131,7 @@ class TorrentClient:
 
     async def start(self):
         try:
-            await self._initialize_storage()
+            self._initialize_storage()
 
             self.tracker = TrackerClient(
                 self.metadata.announce,
@@ -163,3 +164,38 @@ class TorrentClient:
             raise
         finally:
             await self.cleanup()
+
+    # init storage using mmap for quick writes to vir addr spc
+    def _initialize_storage(self):
+        if len(self.metadata.files) == 1:
+            # Single file torrent
+            file_path = self.save_path / self.metadata.files[0].path[0]
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            handle = open(file_path, "wb+")
+            handle.truncate(self.metadata.total_length)
+            handle.flush()
+
+            mmap_obj = mmap.mmap(handle.fileno(), self.metadata.total_length)
+
+            self.file_handles.append(handle)
+            self.file_mmaps.append((0, self.metadata.total_length, mmap_obj))
+
+        else:
+            # Multi-file torrent
+            current_offset = 0
+            for file_info in self.metadata.files:
+                file_path = self.save_path / Path(*file_info.path)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                handle = open(file_path, "wb+")
+                handle.truncate(file_info.length)
+                handle.flush()
+
+                mmap_obj = mmap.mmap(handle.fileno(), file_info.length)
+
+                self.file_handles.append(handle)
+                self.file_mmaps.append((current_offset, file_info.length, mmap_obj))
+                current_offset += file_info.length
+
+        logger.info(f"Initialized storage: {len(self.file_handles)} file(s)")
