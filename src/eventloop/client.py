@@ -215,6 +215,11 @@ class TorrentClient:
                     self._write_piece(offset + write_length, data[write_length:])
                 return
 
+    class TriggerUpdate(Exception):
+        def __init__(self, message="Tracker Updated"):
+            super().__init__(message)
+            logging.info(message)
+
     async def _peer_connector(self, initial_peers: list[tuple[str, int]]):
         peer_queue = asyncio.Queue()
         # Add initial peers
@@ -222,6 +227,7 @@ class TorrentClient:
             await peer_queue.put(peer_info)
 
         connection_semaphore = asyncio.Semaphore(10)  # TCP congestion cntrl
+        last_tracker_request = time.time()
 
         # seen_peers = set()
 
@@ -251,13 +257,21 @@ class TorrentClient:
             try:
                 peer_info = await asyncio.wait_for(peer_queue.get(), timeout=1.0)
                 asyncio.create_task(connect_to_peer(*peer_info))
-            except asyncio.TimeoutError:
+                if time.time() - last_tracker_request > (self.tracker.interval or 300):
+                    raise TorrentClient.TriggerUpdate(
+                        f"Update message sent to tracker at time {time.time()}"
+                    )  # triggers interval update
+
+            except (asyncio.TimeoutError, TorrentClient.TriggerUpdate):
                 # asks for more peers after connecting to all inital peers
-                if peer_queue.empty() and len(self.connected_peers) < 20:
+                if (peer_queue.empty() and len(self.connected_peers) < 20) or (
+                    time.time() - last_tracker_request > (self.tracker.interval or 300)
+                ):
                     try:
                         new_peers = await self.tracker.update(
                             self.downloaded, self.uploaded
                         )
+                        last_tracker_request = time.time()
                         for peer_info in new_peers:
                             await peer_queue.put(peer_info)
                         logger.info(f"Added {len(new_peers)} peers to queue")
