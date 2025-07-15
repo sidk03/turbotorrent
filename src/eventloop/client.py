@@ -1,5 +1,6 @@
 from src.common.logging import config_logging
 from src.torrent.metadata import TorrentMetadata
+from src.tracker.tracker_client import TrackerClient
 from pathlib import Path
 import bitarray
 import random
@@ -126,3 +127,39 @@ class TorrentClient:
         }
 
         logger.info(f"Initialized TorrentClient for {metadata.name}")
+
+    async def start(self):
+        try:
+            await self._initialize_storage()
+
+            self.tracker = TrackerClient(
+                self.metadata.announce,
+                self.info_hash,
+                self.peer_id,
+                self.listen_port,
+                self.metadata.total_length,
+            )
+
+            # Get initial peers
+            initial_peers = await self.tracker.started()
+            logger.info(f"Got {len(initial_peers)} initial peers from tracker")
+
+            # Start workers
+            self.workers = [
+                asyncio.create_task(self._peer_connector(initial_peers)),
+                asyncio.create_task(self._block_scheduler()),
+                asyncio.create_task(self._piece_assembler()),
+                asyncio.create_task(self._rarity_updater()),
+                asyncio.create_task(self._tracker_announcer()),
+                asyncio.create_task(self._stats_reporter()),
+                asyncio.create_task(self._endgame_monitor()),
+                asyncio.create_task(self._stale_block_monitor()),
+            ]
+
+            await self._run_until_complete()
+
+        except Exception as e:
+            logger.error(f"Fatal error in torrent client: {e}")
+            raise
+        finally:
+            await self.cleanup()
