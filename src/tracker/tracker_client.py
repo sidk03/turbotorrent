@@ -82,7 +82,7 @@ class TrackerClient:
             raise Exception(f"Tracker failure: {decoded[b'failure reason'].decode()}")
 
         self.interval = decoded.get(b"interval")
-        self.min_interval = decoded.get(b"min interval")
+        self.min_interval = decoded.get(b"min interval", self.min_interval)
         self.tracker_id = decoded.get(b"tracker id", self.tracker_id)
         self.complete = decoded.get(b"complete")
         self.incomplete = decoded.get(b"incomplete")
