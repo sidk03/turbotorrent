@@ -199,3 +199,17 @@ class TorrentClient:
                 current_offset += file_info.length
 
         logger.info(f"Initialized storage: {len(self.file_handles)} file(s)")
+
+    def _write_piece(self, offset, data):
+        for file_offset, file_length, mmap_obj in self.file_mmaps:
+            if file_offset <= offset < file_offset + file_length:
+                relative_offset = offset - file_offset
+                write_length = min(len(data), file_length - relative_offset)
+                mmap_obj[relative_offset : relative_offset + write_length] = data[
+                    :write_length
+                ]
+
+                if write_length < len(data):
+                    # Block spans multiple files
+                    self._write_piece(offset + write_length, data[write_length:])
+                return
