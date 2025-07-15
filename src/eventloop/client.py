@@ -1,6 +1,7 @@
 from src.common.logging import config_logging
 from src.torrent.metadata import TorrentMetadata
 from src.tracker.tracker_client import TrackerClient
+from src.peer.connected_peer import Peer
 from pathlib import Path
 import bitarray
 import random
@@ -87,7 +88,7 @@ class TorrentClient:
         # Queues
         self.central_queue = asyncio.PriorityQueue(maxsize=2000)
         self.receive_queue = asyncio.Queue(maxsize=1000)
-        self.connected_peers = []
+        self.connected_peers: list[Peer] = []
 
         # File management
         self.file_handles = []
@@ -200,7 +201,7 @@ class TorrentClient:
 
         logger.info(f"Initialized storage: {len(self.file_handles)} file(s)")
 
-    def _write_piece(self, offset, data):
+    def _write_piece(self, offset: int, data: bytes):
         for file_offset, file_length, mmap_obj in self.file_mmaps:
             if file_offset <= offset < file_offset + file_length:
                 relative_offset = offset - file_offset
@@ -213,3 +214,52 @@ class TorrentClient:
                     # Block spans multiple files
                     self._write_piece(offset + write_length, data[write_length:])
                 return
+
+    async def _peer_connector(self, initial_peers: list[tuple[str, int]]):
+        peer_queue = asyncio.Queue()
+        # Add initial peers
+        for peer_info in initial_peers:
+            await peer_queue.put(peer_info)
+
+        connection_semaphore = asyncio.Semaphore(10)  # TCP congestion cntrl
+
+        # seen_peers = set()
+
+        async def connect_to_peer(host: str, port: int):
+            async with connection_semaphore:
+                if len(self.connected_peers) >= MAX_PEERS:
+                    return
+
+            # if (host,port) in seen_peers:
+            #     return
+
+            if any(p.host == host and p.port == port for p in self.connected_peers):
+                return
+
+            try:
+                peer = Peer(host, port, self)
+                await peer.send_connection()
+                self.connected_peers.append(peer)
+                # seen_peers.add((host,port))
+                logger.info(
+                    f"Connected to peer {host}:{port}. Total peers: {len(self.connected_peers)}"
+                )
+            except Exception as e:
+                logger.debug(f"Failed to connect to {host}:{port}: {e}")
+
+        while not self._shutdown:
+            try:
+                peer_info = await asyncio.wait_for(peer_queue.get(), timeout=1.0)
+                asyncio.create_task(connect_to_peer(*peer_info))
+            except asyncio.TimeoutError:
+                # asks for more peers after connecting to all inital peers
+                if peer_queue.empty() and len(self.connected_peers) < 20:
+                    try:
+                        new_peers = await self.tracker.update(
+                            self.downloaded, self.uploaded
+                        )
+                        for peer_info in new_peers:
+                            await peer_queue.put(peer_info)
+                        logger.info(f"Added {len(new_peers)} peers to queue")
+                    except Exception as e:
+                        logger.error(f"Failed to get peers from tracker: {e}")
