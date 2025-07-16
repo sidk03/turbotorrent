@@ -60,7 +60,6 @@ class TorrentClient:
         "piece_buffers",
         "listen_port",
         "global_pending_blocks",
-        "piece_availability",
         "rarity_cache",
         "rarity_cache_time",
         "workers",
@@ -105,8 +104,7 @@ class TorrentClient:
         self.last_piece_length = metadata.total_length - last_piece_start
 
         # Piece selection
-        self.piece_availability = [0] * len(metadata.pieces)
-        self.rarity_cache = []
+        self.rarity_cache: list[tuple[int, int]] = []
         self.rarity_cache_time = 0
 
         # State
@@ -152,7 +150,6 @@ class TorrentClient:
                 asyncio.create_task(self._block_scheduler()),
                 asyncio.create_task(self._piece_assembler()),
                 asyncio.create_task(self._rarity_updater()),
-                asyncio.create_task(self._tracker_announcer()),
                 asyncio.create_task(self._stats_reporter()),
                 asyncio.create_task(self._endgame_monitor()),
                 asyncio.create_task(self._stale_block_monitor()),
@@ -292,21 +289,9 @@ class TorrentClient:
                 # not endgame -> get rarest blocks
                 needed_pieces = self.get_needed_pieces_by_rarity()
 
-                pieces_to_schedule = []
-                for piece_idx in needed_pieces:
+                for priority, piece_idx in needed_pieces[:25]:
                     if piece_idx not in scheduled_pieces:
-                        pieces_to_schedule.append(piece_idx)
-                        if (
-                            len(pieces_to_schedule) >= 25
-                        ):  # schedule 25 blocks at a time
-                            break
-
-                for piece_idx in pieces_to_schedule:
-                    scheduled_pieces.add(piece_idx)
-                    priority = self._get_piece_priority(piece_idx)
-                    await self._schedule_piece_blocks(piece_idx, priority)
-
-                scheduled_pieces = {p for p in scheduled_pieces if not self.bitfield[p]}
+                        await self._schedule_piece_blocks(piece_idx, priority)
 
                 await asyncio.sleep(0.5)
 
@@ -325,17 +310,42 @@ class TorrentClient:
                 priority=priority,
             )
 
+            # this condition dosent hit only in endgame mode
             if (piece_idx, offset) not in self.global_pending_blocks:
                 await self.central_queue.put((priority, block))
                 self.stats["blocks_requested"] += 1
 
-    def _get_piece_length(self, piece_idx: int):
+    def _get_piece_length(self, piece_idx: int) -> int:
         return (
             self.metadata.piece_length
             if piece_idx != len(self.metadata.pieces) - 1
             else self.last_piece_length
         )
 
-    def _get_piece_priority(self, piece_idx: int):
-        availability = self.piece_availability[piece_idx]
-        return availability if availability != 0 else -1000  # no one has piece
+    def _get_needed_pieces_by_rarity(self) -> list[int]:
+        curr_time = time.time()
+
+        # use cache if valid
+        if curr_time - self.rarity_cache_time < RARITY_CACHE_TTL:
+            return [
+                (avail, idx)
+                for avail, idx in self.rarity_cache
+                if not self.bitfield[idx]
+            ]
+        # recalculate
+        piece_availability = [0] * len(self.metadata.pieces)
+        for peer in self.connected_peers:
+            if peer.bitfield:
+                for i, has_piece in enumerate(peer.bitfield):
+                    if has_piece:
+                        self.piece_availability[i] += 1
+
+        self.rarity_cache = []
+        for i, availability in enumerate(piece_availability):
+            if not self.bitfield[i] and availability > 0:
+                self.rarity_cache.append((availability, i))
+
+        self.rarity_cache.sort(key=lambda x: (x[0], random.random()))
+        self.rarity_cache_time = curr_time
+
+        return self.rarity_cache
