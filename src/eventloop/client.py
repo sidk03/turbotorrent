@@ -277,3 +277,37 @@ class TorrentClient:
                         logger.info(f"Added {len(new_peers)} peers to queue")
                     except Exception as e:
                         logger.error(f"Failed to get peers from tracker: {e}")
+
+    async def _block_scheduler(self):
+        scheduled_pieces = set()
+        while not self._shutdown and not self._is_complete():
+            try:
+                if self.endgame_mode:  # schedule all blocks remaining
+                    for piece_idx in range(len(self.metadata.pieces)):
+                        if not self.bitfield[piece_idx]:
+                            await self._schedule_piece_blocks(piece_idx, priority=-1000)
+                    await asyncio.sleep(5)
+                    continue
+
+                # not endgame -> get rarest blocks
+                needed_pieces = self.get_needed_pieces_by_rarity()
+
+                pieces_to_schedule = []
+                for piece_idx in needed_pieces:
+                    if piece_idx not in scheduled_pieces:
+                        pieces_to_schedule.append(piece_idx)
+                        if len(pieces_to_schedule) >= 10:
+                            break
+
+                for piece_idx in pieces_to_schedule:
+                    scheduled_pieces.add(piece_idx)
+                    priority = self._get_piece_priority(piece_idx)
+                    await self._schedule_piece_blocks(piece_idx, priority)
+
+                scheduled_pieces = {p for p in scheduled_pieces if not self.bitfield[p]}
+
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"Block scheduler error: {e}")
+                await asyncio.sleep(1)
