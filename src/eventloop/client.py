@@ -26,11 +26,11 @@ class Block:
         "last_peer",
     )
 
-    def __init__(self, piece_index: int, offset: int, length: int):
+    def __init__(self, piece_index: int, offset: int, length: int, priority: int):
         self.piece_index = piece_index
         self.offset = offset
         self.length = length
-        self.priority = 0  # Lower = higher priority
+        self.priority = priority  # Lower = higher priority
         self.retry_count = 0
         self.last_peer = None  # Track which peer last attempted
 
@@ -296,7 +296,9 @@ class TorrentClient:
                 for piece_idx in needed_pieces:
                     if piece_idx not in scheduled_pieces:
                         pieces_to_schedule.append(piece_idx)
-                        if len(pieces_to_schedule) >= 10:
+                        if (
+                            len(pieces_to_schedule) >= 25
+                        ):  # schedule 25 blocks at a time
                             break
 
                 for piece_idx in pieces_to_schedule:
@@ -311,3 +313,29 @@ class TorrentClient:
             except Exception as e:
                 logger.error(f"Block scheduler error: {e}")
                 await asyncio.sleep(1)
+
+    async def _schedule_piece_blocks(self, piece_idx: int, priority: int):
+        piece_length = self._get_piece_length(piece_idx)
+        for offset in range(0, piece_length, self.block_size):
+            block_length = min(self.block_size, piece_length - offset)
+            block = Block(
+                piece_index=piece_idx,
+                offset=offset,
+                length=block_length,
+                priority=priority,
+            )
+
+            if (piece_idx, offset) not in self.global_pending_blocks:
+                await self.central_queue.put((priority, block))
+                self.stats["blocks_requested"] += 1
+
+    def _get_piece_length(self, piece_idx: int):
+        return (
+            self.metadata.piece_length
+            if piece_idx != len(self.metadata.pieces) - 1
+            else self.last_piece_length
+        )
+
+    def _get_piece_priority(self, piece_idx: int):
+        availability = self.piece_availability[piece_idx]
+        return availability if availability != 0 else -1000  # no one has piece
