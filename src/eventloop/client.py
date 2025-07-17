@@ -91,7 +91,7 @@ class TorrentClient:
 
         # File management
         self.file_handles = []
-        self.file_mmaps = []
+        self.file_mmaps: list[tuple[int, int, mmap.mmap]] = []
 
         # Block management
         self.piece_buffers = {}
@@ -349,3 +349,28 @@ class TorrentClient:
         self.rarity_cache_time = curr_time
 
         return self.rarity_cache
+
+    def _is_complete(self) -> bool:
+        return self.bitfield.all()
+
+    async def cleanup(self):
+        self._shutdown = True
+
+        for worker in self.workers:
+            worker.cancel()
+
+        for peer in self.connected_peers:
+            await peer.cleanup()
+
+        for mmap_obj in self.file_mmaps:
+            mmap_obj[2].close()
+
+        for handle in self.file_handles:
+            handle.close()
+
+        try:
+            await self.tracker.stopped()
+        except Exception:
+            pass
+
+        logger.info("Cleanup complete")

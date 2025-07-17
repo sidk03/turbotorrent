@@ -96,13 +96,13 @@ class Peer:
             logger.info(
                 f"Connection timeout to peer {self.host}:{self.port} during outgoing connection attempt"
             )
-            await self._cleanup()
+            await self.cleanup()
             raise
         except Exception as e:
             logger.error(
                 f"Connection failed for outbound peer {self.host}:{self.port}: {e}"
             )
-            await self._cleanup()
+            await self.cleanup()
             raise
 
     async def accept_connection(
@@ -131,7 +131,7 @@ class Peer:
             logger.error(
                 f"Connection failed for inbound peer {self.host}:{self.port}: {e}"
             )
-            await self._cleanup()
+            await self.cleanup()
             raise
 
     async def _handshake_sequence(self, initiator: bool):
@@ -258,13 +258,13 @@ class Peer:
             logger.warning(
                 f"Bitfield validation error from {self.host}:{self.port}: {e}"
             )
-            await self._cleanup()
+            await self.cleanup()
             raise
         except Exception as e:
             logger.error(
                 f"Unexpected error receiving bitfield from {self.host}:{self.port}: {e}"
             )
-            await self._cleanup()
+            await self.cleanup()
             raise
 
     def _start_workers(self):
@@ -283,7 +283,7 @@ class Peer:
                 logger.warning(
                     f"Peer {self.host}:{self.port} timed out (no messages for {time.time() - self.last_message_time:.1f}s)"
                 )
-                await self._cleanup()
+                await self.cleanup()
                 break
 
             try:
@@ -585,7 +585,7 @@ class Peer:
             self.writer.write(message)
             await self.writer.drain()
 
-    async def _cleanup(self) -> None:
+    async def cleanup(self) -> None:
         self.connected = False
 
         for task in self._workers:
