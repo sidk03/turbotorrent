@@ -10,6 +10,7 @@ import asyncio
 import time
 import logging
 import mmap
+import hashlib
 
 config_logging("torrent.log.jsonl")
 
@@ -403,7 +404,7 @@ class TorrentClient:
             except Exception as e:
                 logger.error(f"Piece assembler error: {e}")
 
-    def _is_piece_complete(self, piece_idx: int):
+    def _is_piece_complete(self, piece_idx: int) -> bool:
         if piece_idx not in self.piece_buffers:
             return False
 
@@ -412,6 +413,19 @@ class TorrentClient:
         received_blocks = set(self.piece_buffers[piece_idx].keys())
 
         return expected_blocks == received_blocks
+
+    def _assemble_piece(self, piece_idx: int) -> bytes:
+        blocks = self.piece_buffers[piece_idx]
+
+        sorted_blocks = sorted(blocks.items(), key=lambda x: x[0])
+        piece_data = b"".join(data for _, data in sorted_blocks)
+
+        return piece_data
+
+    def _verify_piece(self, piece_idx: int, piece_data: bytes) -> bool:
+        piece_hash = hashlib.sha1(piece_data).digest()
+        expected_hash = self.metadata.pieces[piece_idx]
+        return piece_hash == expected_hash
 
     def _is_complete(self) -> bool:
         return self.bitfield.all()
