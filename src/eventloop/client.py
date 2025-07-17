@@ -403,6 +403,16 @@ class TorrentClient:
             except Exception as e:
                 logger.error(f"Piece assembler error: {e}")
 
+    def _is_piece_complete(self, piece_idx: int):
+        if piece_idx not in self.piece_buffers:
+            return False
+
+        piece_length = self._get_piece_length(piece_idx)
+        expected_blocks = set(range(0, piece_length, self.block_size))
+        received_blocks = set(self.piece_buffers[piece_idx].keys())
+
+        return expected_blocks == received_blocks
+
     def _is_complete(self) -> bool:
         return self.bitfield.all()
 
