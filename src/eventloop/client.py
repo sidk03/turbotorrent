@@ -149,7 +149,6 @@ class TorrentClient:
                 asyncio.create_task(self._peer_connector(initial_peers)),
                 asyncio.create_task(self._block_scheduler()),
                 asyncio.create_task(self._piece_assembler()),
-                asyncio.create_task(self._rarity_updater()),
                 asyncio.create_task(self._stats_reporter()),
                 asyncio.create_task(self._endgame_monitor()),
                 asyncio.create_task(self._stale_block_monitor()),
@@ -349,6 +348,60 @@ class TorrentClient:
         self.rarity_cache_time = curr_time
 
         return self.rarity_cache
+
+    async def _piece_assembler(self):
+        while not self._shutdown:
+            try:
+                block, data = await self.receive_queue.get()
+
+                if self.bitfield[block.piece_index]:
+                    logger.debug(
+                        f"Received block for already completed piece {block.piece_index}, discarding"
+                    )
+                    self.stats["bytes_wasted"] += len(data)
+                    continue
+
+                self.downloaded += len(data)
+
+                # rm for global in flight
+                block_id = (block.piece_index, block.offset)
+                self.global_pending_blocks.pop(block_id, None)
+
+                # Storing
+                piece_index = block.piece_index
+                if piece_index not in self.piece_buffers:
+                    self.piece_buffers[piece_index] = {}
+
+                self.piece_buffers[piece_index][block.offset] = data
+
+                if self._is_piece_complete(piece_index):
+                    piece_data = self._assemble_piece(piece_index)
+
+                    if self._verify_piece(piece_index, piece_data):
+                        # write to disk
+                        piece_offset = piece_index * self.metadata.piece_length
+                        self._write_piece(piece_offset, piece_data)
+
+                        self.bitfield[piece_index] = 1
+                        self.stats["pieces_completed"] += 1
+
+                        # notify peers
+                        # await self._broadcast_have(piece_index)
+
+                        del self.piece_buffers[piece_index]
+
+                        logger.info(
+                            f"Piece {piece_index} completed. Progress: {self.stats['pieces_completed']}/{len(self.metadata.pieces)} "
+                            f"({100 * self.stats['pieces_completed'] / len(self.metadata.pieces):.1f}%)"
+                        )
+                    else:
+                        logger.warning(f"Piece {piece_index} failed hash verification")
+
+                        # clear and reschedule
+                        del self.piece_buffers[piece_index]
+                        await self._schedule_piece_blocks(piece_index, priority=-500)
+            except Exception as e:
+                logger.error(f"Piece assembler error: {e}")
 
     def _is_complete(self) -> bool:
         return self.bitfield.all()
