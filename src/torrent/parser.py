@@ -26,7 +26,7 @@ def parse_torrent_file(path: Path) -> TorrentMetadata:
     if b"files" in info:
         for file_dict in info[b"files"]:
             length = file_dict[b"length"]
-            path_segments = [seg.decode("utf-8") for seg in file_dict[b"path"]]
+            path_segments = "".join([seg.decode("utf-8") for seg in file_dict[b"path"]])
             files.append(TorrentFile(path_segments, length, offset))
             offset += length
         total_length = offset
@@ -35,7 +35,7 @@ def parse_torrent_file(path: Path) -> TorrentMetadata:
         )
     else:
         length = info[b"length"]
-        files.append(TorrentFile([name], length, 0))
+        files.append(TorrentFile(name, length, 0))
         total_length = length
         logger.info(f"Parsed single-file torrent: {name} ({total_length} bytes)")
 

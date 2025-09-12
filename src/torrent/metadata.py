@@ -1,7 +1,7 @@
 class TorrentFile:
     __slots__ = ("path", "length", "offset")
 
-    def __init__(self, path: list[str], length: int, offset: int):
+    def __init__(self, path: str, length: int, offset: int):
         self.path = path
         self.length = length
         self.offset = offset
