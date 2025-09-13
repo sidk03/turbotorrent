@@ -5,6 +5,7 @@ import struct
 import math
 import logging
 import time
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -300,8 +301,9 @@ class Peer:
 
     async def _request_worker(self):
         logger.info(f"Request worker started for peer {self.host}:{self.port}")
-        acq = False
+        
         while self.connected:
+            semaphore_acquired = False
             try:
                 # Apply throttling BEFORE acquiring semaphore and getting block
                 if not self.skip_next_throttle:
@@ -311,7 +313,7 @@ class Peer:
                     self.skip_next_throttle = False
                 
                 await self.semaphore.acquire()
-                acq = True
+                semaphore_acquired = True
 
                 priority, block = await self.client.central_queue.get()
 
@@ -319,7 +321,7 @@ class Peer:
                 if not self.bitfield or not self.bitfield[block.piece_index]:
                     await self.client.central_queue.put((priority, block))
                     self.semaphore.release()
-                    acq = False
+                    semaphore_acquired = False
                     self.skip_next_throttle = True  # Don't throttle next time - invalid block
                     await asyncio.sleep(0.01)  # Prevent tight loop
                     continue
@@ -331,7 +333,7 @@ class Peer:
                     )
                     await self.client.central_queue.put((priority, block))
                     self.semaphore.release()
-                    acq = False
+                    semaphore_acquired = False
                     self.skip_next_throttle = True  # Don't throttle next time - peer choking
                     await asyncio.sleep(0.1)  # Wait a bit before trying again
                     continue
@@ -341,7 +343,7 @@ class Peer:
                 # Skip if this peer already has this block in flight
                 if block_id in self.pending_requests:
                     self.semaphore.release()
-                    acq = False
+                    semaphore_acquired = False
                     await self.client.central_queue.put((priority, block))
                     self.skip_next_throttle = True  # Don't throttle next time - duplicate
                     continue
@@ -359,7 +361,7 @@ class Peer:
                 self.skip_next_throttle = False
 
             except Exception as e:
-                if acq:
+                if semaphore_acquired:
                     self.semaphore.release()
                 logger.error(
                     f"Request worker error for peer {self.host}:{self.port}: {e}"
@@ -368,27 +370,22 @@ class Peer:
         logger.info(f"Request worker stopped for peer {self.host}:{self.port}")
 
     async def _apply_adaptive_throttle(self):
-        """Apply adaptive throttling based on peer performance score."""
-        if self.score < 0.2:
-            # Very poor performance - long delay
-            delay = 2.0
-        elif self.score < 0.4:
-            # Poor performance - significant delay
-            delay = 1.0
-        elif self.score < 0.6:
-            # Below average - moderate delay
-            delay = 0.5
-        elif self.score < 0.8:
-            # Average - small delay
-            delay = 0.2
-        elif self.score < 0.95:
-            # Good - minimal delay
-            delay = 0.05
-        else:
-            # Excellent - no delay
+        """Apply adaptive throttling with exponential curve for poor performers."""
+        if self.score >= 0.9:
             delay = 0
+        elif self.score >= 0.7:
+            delay = (0.9 - self.score) * 0.5  # 0-0.1s light throttling
+        elif self.score >= 0.4:
+            delay = (0.7 - self.score) * 2.0   # 0.1-0.6s moderate throttling  
+        else:
+            delay = 0.6 + (0.4 - self.score) * 5.0  # 0.6-2.6s heavy throttling
         
+        # Add jitter to prevent thundering herd
         if delay > 0:
+            jitter = random.uniform(0.8, 1.2)
+            delay *= jitter
+            
+        if delay > 0.05:  # Only log significant throttling
             logger.debug(
                 f"Throttling peer {self.host}:{self.port} for {delay:.2f}s (score: {self.score:.2f})"
             )
@@ -586,16 +583,21 @@ class Peer:
                 f"Block request completed for {self.host}:{self.port}: response_time={response_time:.3f}s, score={self.score:.2f}, completed={self.stats['completed']}"
             )
 
-            # Increase score gradually
-            if self.consecutive_successes < 5:
-                # Small increase for initial successes
-                self.score = min(1.0, self.score + 0.02)
-            elif self.consecutive_successes < 20:
-                # Moderate increase for consistent performance
-                self.score = min(1.0, self.score + 0.03)
-            else:
-                # Larger increase for excellent performance
-                self.score = min(1.0, self.score + 0.05)
+            # Factor in response time for more nuanced scoring
+            if response_time < 2.0:  # Fast response
+                score_increase = 0.05
+            elif response_time < 5.0:  # Normal response  
+                score_increase = 0.03
+            else:  # Slow response
+                score_increase = 0.01
+                
+            # Apply consecutive success multiplier
+            if self.consecutive_successes >= 20:
+                score_increase *= 1.5
+            elif self.consecutive_successes >= 10:
+                score_increase *= 1.2
+                
+            self.score = min(1.0, self.score + score_increase)
             
             # Log significant improvements
             if self.consecutive_successes == 10:
