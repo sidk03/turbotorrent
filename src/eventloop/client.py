@@ -435,7 +435,7 @@ class TorrentClient:
         """Wait until download is complete or shutdown is requested."""
         while not self._shutdown and not self._is_complete():
             await asyncio.sleep(1)
-        
+
         if self._is_complete():
             logger.info(f"Download complete! Downloaded {self.metadata.name}")
             await self.tracker.completed()
@@ -447,26 +447,32 @@ class TorrentClient:
         last_downloaded = 0
         while not self._shutdown:
             await asyncio.sleep(10)  # Report every 10 seconds
-            
+
             if self.connected_peers:
                 current_downloaded = self.downloaded
-                download_speed = (current_downloaded - last_downloaded) / 10  # bytes per second
+                download_speed = (
+                    current_downloaded - last_downloaded
+                ) / 10  # bytes per second
                 last_downloaded = current_downloaded
-                
-                progress_pct = 100 * self.stats["pieces_completed"] / len(self.metadata.pieces) if len(self.metadata.pieces) > 0 else 0
-                
+
+                progress_pct = (
+                    100 * self.stats["pieces_completed"] / len(self.metadata.pieces)
+                    if len(self.metadata.pieces) > 0
+                    else 0
+                )
+
                 logger.info(
                     f"Stats: {self.stats['pieces_completed']}/{len(self.metadata.pieces)} pieces "
                     f"({progress_pct:.1f}%), {len(self.connected_peers)} peers, "
                     f"Speed: {download_speed / 1024:.1f} KB/s, "
-                    f"Downloaded: {self.downloaded / (1024*1024):.1f} MB"
+                    f"Downloaded: {self.downloaded / (1024 * 1024):.1f} MB"
                 )
 
     async def _endgame_monitor(self):
         """Monitor download progress and switch to endgame mode when appropriate."""
         while not self._shutdown and not self._is_complete():
             await asyncio.sleep(5)
-            
+
             if not self.endgame_mode:
                 progress = self.stats["pieces_completed"] / len(self.metadata.pieces)
                 if progress >= self.endgame_threshold:
@@ -475,7 +481,7 @@ class TorrentClient:
                         f"Entering endgame mode at {progress * 100:.1f}% completion "
                         f"({self.stats['pieces_completed']}/{len(self.metadata.pieces)} pieces)"
                     )
-                    
+
                     # Clear the queue and reschedule all remaining pieces
                     while not self.central_queue.empty():
                         try:
@@ -487,16 +493,20 @@ class TorrentClient:
         """Monitor and re-queue stale blocks that haven't been completed."""
         while not self._shutdown:
             await asyncio.sleep(30)  # Check every 30 seconds
-            
+
             current_time = time.time()
             stale_blocks = []
-            
+
             # Check global pending blocks for stale entries
-            for block_id, (timestamp, block) in list(self.global_pending_blocks.items()):
-                if current_time - timestamp > 60:  # Block pending for more than 60 seconds
+            for block_id, (timestamp, block) in list(
+                self.global_pending_blocks.items()
+            ):
+                if (
+                    current_time - timestamp > 60
+                ):  # Block pending for more than 60 seconds
                     stale_blocks.append(block)
                     del self.global_pending_blocks[block_id]
-            
+
             if stale_blocks:
                 logger.warning(f"Re-queuing {len(stale_blocks)} stale blocks")
                 for block in stale_blocks:

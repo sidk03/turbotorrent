@@ -64,7 +64,7 @@ class Peer:
         self.max_concurrent = 30  # Fixed maximum concurrency
         self.score = 1.0
         self.semaphore = asyncio.Semaphore(30)  # Fixed semaphore capacity
-        
+
         # Adaptive throttling
         self.skip_next_throttle = False  # Skip throttle if last block was invalid
         self.consecutive_successes = 0
@@ -209,7 +209,9 @@ class Peer:
 
     def _is_duplicate_peer(self) -> bool:
         return any(
-            ((p.host == self.host and p.port==self.port) or p.peer_id == self.peer_id) and p != self and p.connected
+            ((p.host == self.host and p.port == self.port) or p.peer_id == self.peer_id)
+            and p != self
+            and p.connected
             for p in self.client.connected_peers
         )
 
@@ -301,7 +303,7 @@ class Peer:
 
     async def _request_worker(self):
         logger.info(f"Request worker started for peer {self.host}:{self.port}")
-        
+
         while self.connected:
             semaphore_acquired = False
             try:
@@ -311,7 +313,7 @@ class Peer:
                 else:
                     # Reset the skip flag
                     self.skip_next_throttle = False
-                
+
                 await self.semaphore.acquire()
                 semaphore_acquired = True
 
@@ -322,7 +324,9 @@ class Peer:
                     await self.client.central_queue.put((priority, block))
                     self.semaphore.release()
                     semaphore_acquired = False
-                    self.skip_next_throttle = True  # Don't throttle next time - invalid block
+                    self.skip_next_throttle = (
+                        True  # Don't throttle next time - invalid block
+                    )
                     await asyncio.sleep(0.01)  # Prevent tight loop
                     continue
 
@@ -334,7 +338,9 @@ class Peer:
                     await self.client.central_queue.put((priority, block))
                     self.semaphore.release()
                     semaphore_acquired = False
-                    self.skip_next_throttle = True  # Don't throttle next time - peer choking
+                    self.skip_next_throttle = (
+                        True  # Don't throttle next time - peer choking
+                    )
                     await asyncio.sleep(0.1)  # Wait a bit before trying again
                     continue
 
@@ -345,7 +351,9 @@ class Peer:
                     self.semaphore.release()
                     semaphore_acquired = False
                     await self.client.central_queue.put((priority, block))
-                    self.skip_next_throttle = True  # Don't throttle next time - duplicate
+                    self.skip_next_throttle = (
+                        True  # Don't throttle next time - duplicate
+                    )
                     continue
 
                 # Mark block as globally pending
@@ -356,7 +364,7 @@ class Peer:
                 )
                 # Fire away do not block
                 asyncio.create_task(self._request_block(block))
-                
+
                 # Valid block requested - don't skip throttle next time
                 self.skip_next_throttle = False
 
@@ -376,15 +384,15 @@ class Peer:
         elif self.score >= 0.7:
             delay = (0.9 - self.score) * 0.5  # 0-0.1s light throttling
         elif self.score >= 0.4:
-            delay = (0.7 - self.score) * 2.0   # 0.1-0.6s moderate throttling  
+            delay = (0.7 - self.score) * 2.0  # 0.1-0.6s moderate throttling
         else:
             delay = 0.6 + (0.4 - self.score) * 5.0  # 0.6-2.6s heavy throttling
-        
+
         # Add jitter to prevent thundering herd
         if delay > 0:
             jitter = random.uniform(0.8, 1.2)
             delay *= jitter
-            
+
         if delay > 0.05:  # Only log significant throttling
             logger.debug(
                 f"Throttling peer {self.host}:{self.port} for {delay:.2f}s (score: {self.score:.2f})"
@@ -578,7 +586,7 @@ class Peer:
             self.stats["completed"] += 1
             self.consecutive_successes += 1
             self.consecutive_failures = 0
-            
+
             logger.info(
                 f"Block request completed for {self.host}:{self.port}: response_time={response_time:.3f}s, score={self.score:.2f}, completed={self.stats['completed']}"
             )
@@ -586,19 +594,19 @@ class Peer:
             # Factor in response time for more nuanced scoring
             if response_time < 2.0:  # Fast response
                 score_increase = 0.05
-            elif response_time < 5.0:  # Normal response  
+            elif response_time < 5.0:  # Normal response
                 score_increase = 0.03
             else:  # Slow response
                 score_increase = 0.01
-                
+
             # Apply consecutive success multiplier
             if self.consecutive_successes >= 20:
                 score_increase *= 1.5
             elif self.consecutive_successes >= 10:
                 score_increase *= 1.2
-                
+
             self.score = min(1.0, self.score + score_increase)
-            
+
             # Log significant improvements
             if self.consecutive_successes == 10:
                 logger.info(
@@ -613,7 +621,7 @@ class Peer:
             self.stats["timeouts"] += 1
             self.consecutive_failures += 1
             self.consecutive_successes = 0
-            
+
             logger.warning(
                 f"Block request timeout for {self.host}:{self.port}: score={self.score:.2f}, timeouts={self.stats['timeouts']}"
             )
@@ -628,7 +636,7 @@ class Peer:
             else:
                 # Many failures - severe penalty
                 self.score = max(0.1, self.score - 0.25)
-            
+
             # Log significant degradations
             if self.consecutive_failures == 3:
                 logger.warning(
