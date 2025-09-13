@@ -29,13 +29,17 @@ class Peer:
         "max_concurrent",
         "score",
         "semaphore",
+        # Adaptive throttling
+        "skip_next_throttle",
+        "consecutive_successes",
+        "consecutive_failures",
         # Performance
         "stats",
         "last_message_time",
         # Client
         "client",
         # Workers
-        "workers",
+        "_workers",
     )
 
     def __init__(self, host: str, port: int, client: TorrentClient):
@@ -56,9 +60,14 @@ class Peer:
 
         # Processing
         self.pending_requests: dict[tuple[int, int], tuple[asyncio.Future, Block]] = {}
-        self.max_concurrent = 10
+        self.max_concurrent = 30  # Fixed maximum concurrency
         self.score = 1.0
-        self.semaphore = asyncio.Semaphore(10)
+        self.semaphore = asyncio.Semaphore(30)  # Fixed semaphore capacity
+        
+        # Adaptive throttling
+        self.skip_next_throttle = False  # Skip throttle if last block was invalid
+        self.consecutive_successes = 0
+        self.consecutive_failures = 0
 
         # Stats
         self.stats = {
@@ -294,50 +303,60 @@ class Peer:
         acq = False
         while self.connected:
             try:
-                await (
-                    self.semaphore.acquire()
-                )  # acquired here, released after future reolved or timedout
+                # Apply throttling BEFORE acquiring semaphore and getting block
+                if not self.skip_next_throttle:
+                    await self._apply_adaptive_throttle()
+                else:
+                    # Reset the skip flag
+                    self.skip_next_throttle = False
+                
+                await self.semaphore.acquire()
                 acq = True
 
-                if self.score < 1.0:
-                    await asyncio.sleep((1 - self.score) * 0.5)
+                priority, block = await self.client.central_queue.get()
 
-                priority,block = await self.client.central_queue.get()
-
+                # Check if peer has this piece
                 if not self.bitfield or not self.bitfield[block.piece_index]:
-                    await self.client.central_queue.put((priority,block))
+                    await self.client.central_queue.put((priority, block))
                     self.semaphore.release()
                     acq = False
+                    self.skip_next_throttle = True  # Don't throttle next time - invalid block
                     await asyncio.sleep(0.01)  # Prevent tight loop
                     continue
 
+                # Check if peer is choking us
                 if self.peer_choking:
-                    logger.info(
+                    logger.debug(
                         f"Peer {self.host}:{self.port} is choking us, re-queuing block {block.piece_index}:{block.offset}"
                     )
-                    await self.client.central_queue.put((priority,block))
+                    await self.client.central_queue.put((priority, block))
                     self.semaphore.release()
                     acq = False
+                    self.skip_next_throttle = True  # Don't throttle next time - peer choking
                     await asyncio.sleep(0.1)  # Wait a bit before trying again
                     continue
 
                 block_id = (block.piece_index, block.offset)
 
-                # Skip if this peer alr has this block in flight
+                # Skip if this peer already has this block in flight
                 if block_id in self.pending_requests:
                     self.semaphore.release()
                     acq = False
-                    await self.client.central_queue.put((priority,block))
+                    await self.client.central_queue.put((priority, block))
+                    self.skip_next_throttle = True  # Don't throttle next time - duplicate
                     continue
 
                 # Mark block as globally pending
                 self.client.global_pending_blocks[block_id] = (time.time(), block)
 
-                logger.info(
+                logger.debug(
                     f"Requesting block from {self.host}:{self.port}: piece {block.piece_index}, offset {block.offset}, length {block.length}"
                 )
                 # Fire away do not block
                 asyncio.create_task(self._request_block(block))
+                
+                # Valid block requested - don't skip throttle next time
+                self.skip_next_throttle = False
 
             except Exception as e:
                 if acq:
@@ -347,6 +366,33 @@ class Peer:
                 )
                 await asyncio.sleep(1)
         logger.info(f"Request worker stopped for peer {self.host}:{self.port}")
+
+    async def _apply_adaptive_throttle(self):
+        """Apply adaptive throttling based on peer performance score."""
+        if self.score < 0.2:
+            # Very poor performance - long delay
+            delay = 2.0
+        elif self.score < 0.4:
+            # Poor performance - significant delay
+            delay = 1.0
+        elif self.score < 0.6:
+            # Below average - moderate delay
+            delay = 0.5
+        elif self.score < 0.8:
+            # Average - small delay
+            delay = 0.2
+        elif self.score < 0.95:
+            # Good - minimal delay
+            delay = 0.05
+        else:
+            # Excellent - no delay
+            delay = 0
+        
+        if delay > 0:
+            logger.debug(
+                f"Throttling peer {self.host}:{self.port} for {delay:.2f}s (score: {self.score:.2f})"
+            )
+            await asyncio.sleep(delay)
 
     async def _request_block(self, block):
         block_id = (block.piece_index, block.offset)
@@ -533,44 +579,63 @@ class Peer:
     def _update_stats(self, success: bool, response_time: float = 0):
         if success:
             self.stats["completed"] += 1
+            self.consecutive_successes += 1
+            self.consecutive_failures = 0
+            
             logger.info(
                 f"Block request completed for {self.host}:{self.port}: response_time={response_time:.3f}s, score={self.score:.2f}, completed={self.stats['completed']}"
             )
 
-            # Increase score
-            self.score = min(1.0, self.score + 0.02)
-
-            # Adaptive concurrency
-            if self.stats["completed"] & 15 == 0:  # Every 16 successes
-                if self.score > 0.9:
-                    new_max = min(30, self.max_concurrent + 2)
-                    delta = new_max - self.max_concurrent
-                    if delta > 0:
-                        logger.info(
-                            f"Increasing concurrency for {self.host}:{self.port}: {self.max_concurrent} -> {new_max}"
-                        )
-                        for _ in range(delta):
-                            self.semaphore.release()
-                    self.max_concurrent = new_max
+            # Increase score gradually
+            if self.consecutive_successes < 5:
+                # Small increase for initial successes
+                self.score = min(1.0, self.score + 0.02)
+            elif self.consecutive_successes < 20:
+                # Moderate increase for consistent performance
+                self.score = min(1.0, self.score + 0.03)
+            else:
+                # Larger increase for excellent performance
+                self.score = min(1.0, self.score + 0.05)
+            
+            # Log significant improvements
+            if self.consecutive_successes == 10:
+                logger.info(
+                    f"Peer {self.host}:{self.port} showing consistent good performance (10 consecutive successes, score: {self.score:.2f})"
+                )
+            elif self.consecutive_successes == 50:
+                logger.info(
+                    f"Peer {self.host}:{self.port} showing excellent performance (50 consecutive successes, score: {self.score:.2f})"
+                )
 
         else:
             self.stats["timeouts"] += 1
+            self.consecutive_failures += 1
+            self.consecutive_successes = 0
+            
             logger.warning(
                 f"Block request timeout for {self.host}:{self.port}: score={self.score:.2f}, timeouts={self.stats['timeouts']}"
             )
 
-            # Decrease score
-            self.score = max(0.1, self.score - 0.15)
-
-            # Reduce concurrency
-            if self.stats["timeouts"] & 3 == 0:  # Every 4 timeouts
-                old_max = self.max_concurrent
-                self.max_concurrent = max(2, self.max_concurrent - 2)
-                logger.info(
-                    f"Reducing concurrency for {self.host}:{self.port}: {old_max} -> {self.max_concurrent}"
+            # Decrease score more aggressively for consecutive failures
+            if self.consecutive_failures == 1:
+                # First failure - moderate decrease
+                self.score = max(0.1, self.score - 0.10)
+            elif self.consecutive_failures < 5:
+                # Multiple failures - larger decrease
+                self.score = max(0.1, self.score - 0.15)
+            else:
+                # Many failures - severe penalty
+                self.score = max(0.1, self.score - 0.25)
+            
+            # Log significant degradations
+            if self.consecutive_failures == 3:
+                logger.warning(
+                    f"Peer {self.host}:{self.port} experiencing issues (3 consecutive failures, score: {self.score:.2f})"
                 )
-
-            # I need to figure out how to decrease semaphore count
+            elif self.consecutive_failures == 10:
+                logger.error(
+                    f"Peer {self.host}:{self.port} severely degraded (10 consecutive failures, score: {self.score:.2f})"
+                )
 
     async def send_interested(self):
         if not self.am_interested:
