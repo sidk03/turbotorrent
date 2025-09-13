@@ -42,7 +42,7 @@ class Peer:
         # Network State
         self.host = host
         self.port = port
-        self.peer_id: str = None
+        self.peer_id: bytes = None
         self.reader: asyncio.StreamReader = None
         self.writer: asyncio.StreamWriter = None
         self.connected = False
@@ -92,12 +92,6 @@ class Peer:
             self._start_workers()
             logger.info(f"Started worker tasks for peer {self.host}:{self.port}")
 
-        except asyncio.TimeoutError:
-            logger.info(
-                f"Connection timeout to peer {self.host}:{self.port} during outgoing connection attempt"
-            )
-            await self.cleanup()
-            raise
         except Exception as e:
             logger.error(
                 f"Connection failed for outbound peer {self.host}:{self.port}: {e}"
@@ -154,7 +148,7 @@ class Peer:
         handshake = struct.pack(
             "!B19s8s20s20s",
             19,
-            "BitTorrent protocol",
+            b"BitTorrent protocol",
             b"\x00" * 8,
             self.client.metadata.info_hash,
             self.client.tracker.peer_id,
@@ -192,7 +186,7 @@ class Peer:
             )
 
             # Decide what to do with duplicate connections !!!
-            if self._is_duplicate_peer(peer_id):
+            if self._is_duplicate_peer():
                 logger.warning(
                     f"Duplicate connection detected for peer {peer_id.hex()[:8]}... at {self.host}:{self.port}"
                 )
@@ -203,9 +197,9 @@ class Peer:
         except struct.error as e:
             raise ValueError(f"Invalid handshake format: {e}")
 
-    def _is_duplicate_peer(self, peer_id: bytes) -> bool:
+    def _is_duplicate_peer(self) -> bool:
         return any(
-            p.peer_id == peer_id and p != self and p.connected
+            ((p.host == self.host and p.port==self.port) or p.peer_id == self.peer_id) and p != self and p.connected
             for p in self.client.connected_peers
         )
 
@@ -226,7 +220,7 @@ class Peer:
 
     async def _receive_bitfield(self, payload: bytes):
         try:
-            num_pieces = self.client.metadata.pieces
+            num_pieces = len(self.client.metadata.pieces)
             expected_length = math.ceil(num_pieces / 8)
 
             if len(payload) != expected_length:
@@ -297,20 +291,23 @@ class Peer:
 
     async def _request_worker(self):
         logger.info(f"Request worker started for peer {self.host}:{self.port}")
+        acq = False
         while self.connected:
             try:
                 await (
                     self.semaphore.acquire()
                 )  # acquired here, released after future reolved or timedout
+                acq = True
 
                 if self.score < 1.0:
                     await asyncio.sleep((1 - self.score) * 0.5)
 
-                block = await self.client.central_queue.get()
+                priority,block = await self.client.central_queue.get()
 
                 if not self.bitfield or not self.bitfield[block.piece_index]:
-                    await self.client.central_queue.put(block)
+                    await self.client.central_queue.put((priority,block))
                     self.semaphore.release()
+                    acq = False
                     await asyncio.sleep(0.01)  # Prevent tight loop
                     continue
 
@@ -318,8 +315,9 @@ class Peer:
                     logger.info(
                         f"Peer {self.host}:{self.port} is choking us, re-queuing block {block.piece_index}:{block.offset}"
                     )
-                    await self.client.central_queue.put(block)
+                    await self.client.central_queue.put((priority,block))
                     self.semaphore.release()
+                    acq = False
                     await asyncio.sleep(0.1)  # Wait a bit before trying again
                     continue
 
@@ -328,8 +326,12 @@ class Peer:
                 # Skip if this peer alr has this block in flight
                 if block_id in self.pending_requests:
                     self.semaphore.release()
-                    await self.client.central_queue.put(block)
+                    acq = False
+                    await self.client.central_queue.put((priority,block))
                     continue
+
+                # Mark block as globally pending
+                self.client.global_pending_blocks[block_id] = (time.time(), block)
 
                 logger.info(
                     f"Requesting block from {self.host}:{self.port}: piece {block.piece_index}, offset {block.offset}, length {block.length}"
@@ -338,7 +340,8 @@ class Peer:
                 asyncio.create_task(self._request_block(block))
 
             except Exception as e:
-                self.semaphore.release()
+                if acq:
+                    self.semaphore.release()
                 logger.error(
                     f"Request worker error for peer {self.host}:{self.port}: {e}"
                 )
@@ -382,11 +385,11 @@ class Peer:
 
                 block.retry_count = getattr(block, "retry_count", 0) + 1
                 block.priority = -1000 - block.retry_count
-                await self.client.central_queue.put(block)
+                await self.client.central_queue.put((block.priority, block))
 
         except Exception as e:
             logger.error(f"Block request error {block_id}: {e}")
-            await self.client.central_queue.put(block)
+            await self.client.central_queue.put((block.priority, block))
 
         finally:
             self.semaphore.release()
@@ -443,7 +446,7 @@ class Peer:
                 break
 
         logger.info(f"Receive worker stopped for peer {self.host}:{self.port}")
-        await self._cleanup()
+        await self.cleanup()
 
     async def _handle_message(self, msg_id: int, payload: bytes):
         if msg_id == 0:  # Choke
@@ -600,7 +603,7 @@ class Peer:
 
         if self.pending_requests:
             for _, block in self.pending_requests.values():
-                await self.client.central_queue.put(block)
+                await self.client.central_queue.put((block.priority, block))
 
         try:
             self.client.connected_peers.remove(self)

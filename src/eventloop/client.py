@@ -167,7 +167,7 @@ class TorrentClient:
     def _initialize_storage(self):
         if len(self.metadata.files) == 1:
             # Single file torrent
-            file_path = self.save_path / self.metadata.files[0].path[0]
+            file_path = self.save_path / self.metadata.files[0].path
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             handle = open(file_path, "wb+")
@@ -287,7 +287,7 @@ class TorrentClient:
                     continue
 
                 # not endgame -> get rarest blocks
-                needed_pieces = self.get_needed_pieces_by_rarity()
+                needed_pieces = self._get_needed_pieces_by_rarity()
 
                 for priority, piece_idx in needed_pieces[:25]:
                     if piece_idx not in scheduled_pieces:
@@ -313,6 +313,7 @@ class TorrentClient:
             # this condition dosent hit only in endgame mode
             if (piece_idx, offset) not in self.global_pending_blocks:
                 await self.central_queue.put((priority, block))
+                self.global_pending_blocks[(piece_idx, offset)] = (time.time(), block)
                 self.stats["blocks_requested"] += 1
 
     def _get_piece_length(self, piece_idx: int) -> int:
@@ -338,7 +339,7 @@ class TorrentClient:
             if peer.bitfield:
                 for i, has_piece in enumerate(peer.bitfield):
                     if has_piece:
-                        self.piece_availability[i] += 1
+                        piece_availability[i] += 1
 
         self.rarity_cache = []
         for i, availability in enumerate(piece_availability):
@@ -429,6 +430,79 @@ class TorrentClient:
 
     def _is_complete(self) -> bool:
         return self.bitfield.all()
+
+    async def _run_until_complete(self):
+        """Wait until download is complete or shutdown is requested."""
+        while not self._shutdown and not self._is_complete():
+            await asyncio.sleep(1)
+        
+        if self._is_complete():
+            logger.info(f"Download complete! Downloaded {self.metadata.name}")
+            await self.tracker.completed()
+        else:
+            logger.info("Download interrupted before completion")
+
+    async def _stats_reporter(self):
+        """Periodically report download statistics."""
+        last_downloaded = 0
+        while not self._shutdown:
+            await asyncio.sleep(10)  # Report every 10 seconds
+            
+            if self.connected_peers:
+                current_downloaded = self.downloaded
+                download_speed = (current_downloaded - last_downloaded) / 10  # bytes per second
+                last_downloaded = current_downloaded
+                
+                progress_pct = 100 * self.stats["pieces_completed"] / len(self.metadata.pieces) if len(self.metadata.pieces) > 0 else 0
+                
+                logger.info(
+                    f"Stats: {self.stats['pieces_completed']}/{len(self.metadata.pieces)} pieces "
+                    f"({progress_pct:.1f}%), {len(self.connected_peers)} peers, "
+                    f"Speed: {download_speed / 1024:.1f} KB/s, "
+                    f"Downloaded: {self.downloaded / (1024*1024):.1f} MB"
+                )
+
+    async def _endgame_monitor(self):
+        """Monitor download progress and switch to endgame mode when appropriate."""
+        while not self._shutdown and not self._is_complete():
+            await asyncio.sleep(5)
+            
+            if not self.endgame_mode:
+                progress = self.stats["pieces_completed"] / len(self.metadata.pieces)
+                if progress >= self.endgame_threshold:
+                    self.endgame_mode = True
+                    logger.info(
+                        f"Entering endgame mode at {progress * 100:.1f}% completion "
+                        f"({self.stats['pieces_completed']}/{len(self.metadata.pieces)} pieces)"
+                    )
+                    
+                    # Clear the queue and reschedule all remaining pieces
+                    while not self.central_queue.empty():
+                        try:
+                            self.central_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+    async def _stale_block_monitor(self):
+        """Monitor and re-queue stale blocks that haven't been completed."""
+        while not self._shutdown:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            
+            current_time = time.time()
+            stale_blocks = []
+            
+            # Check global pending blocks for stale entries
+            for block_id, (timestamp, block) in list(self.global_pending_blocks.items()):
+                if current_time - timestamp > 60:  # Block pending for more than 60 seconds
+                    stale_blocks.append(block)
+                    del self.global_pending_blocks[block_id]
+            
+            if stale_blocks:
+                logger.warning(f"Re-queuing {len(stale_blocks)} stale blocks")
+                for block in stale_blocks:
+                    block.retry_count = getattr(block, "retry_count", 0) + 1
+                    block.priority = -500 - block.retry_count
+                    await self.central_queue.put((block.priority, block))
 
     async def cleanup(self):
         self._shutdown = True
